@@ -1,0 +1,5055 @@
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional
+import logging
+from datetime import datetime, timedelta
+import requests
+from textblob import TextBlob
+import tweepy
+from newsapi import NewsApiClient
+import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+
+logger = logging.getLogger(__name__)
+
+class SentimentAnalyzer:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.news_api = NewsApiClient(api_key=config['news_api_key'])
+        self.twitter_auth = tweepy.OAuthHandler(
+            config['twitter_api_key'],
+            config['twitter_api_secret']
+        )
+        self.twitter_auth.set_access_token(
+            config['twitter_access_token'],
+            config['twitter_access_token_secret']
+        )
+        self.twitter_api = tweepy.API(self.twitter_auth)
+        
+        # Initialize sentiment cache
+        self.sentiment_cache = {}
+        self.cache_duration = timedelta(hours=1)
+        
+    def analyze_text(self, text: str) -> float:
+        """
+        Analyze sentiment of a single text using TextBlob
+        """
+        try:
+            analysis = TextBlob(text)
+            # Normalize sentiment score to [-1, 1]
+            return analysis.sentiment.polarity
+        except Exception as e:
+            logger.error(f"Error analyzing text: {str(e)}")
+            return 0.0
+    
+    def get_news_sentiment(self, symbol: str) -> Optional[float]:
+        """
+        Get sentiment from news articles
+        """
+        try:
+            # Check cache first
+            cache_key = f"news_{symbol}"
+            if cache_key in self.sentiment_cache:
+                cached_data = self.sentiment_cache[cache_key]
+                if datetime.now() - cached_data['timestamp'] < self.cache_duration:
+                    return cached_data['sentiment']
+            
+            # Get news articles
+            news = self.news_api.get_everything(
+                q=symbol,
+                language='en',
+                from_param=(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'),
+                sort_by='relevancy'
+            )
+            
+            if not news['articles']:
+                return None
+            
+            # Analyze sentiment of each article
+            sentiments = []
+            for article in news['articles']:
+                title_sentiment = self.analyze_text(article['title'])
+                if article['description']:
+                    desc_sentiment = self.analyze_text(article['description'])
+                    sentiments.append((title_sentiment + desc_sentiment) / 2)
+                else:
+                    sentiments.append(title_sentiment)
+            
+            # Calculate weighted average sentiment
+            avg_sentiment = np.mean(sentiments)
+            
+            # Cache the result
+            self.sentiment_cache[cache_key] = {
+                'sentiment': avg_sentiment,
+                'timestamp': datetime.now()
+            }
+            
+            return avg_sentiment
+            
+        except Exception as e:
+            logger.error(f"Error getting news sentiment: {str(e)}")
+            return None
+    
+    def get_twitter_sentiment(self, symbol: str) -> Optional[float]:
+        """
+        Get sentiment from Twitter
+        """
+        try:
+            # Check cache first
+            cache_key = f"twitter_{symbol}"
+            if cache_key in self.sentiment_cache:
+                cached_data = self.sentiment_cache[cache_key]
+                if datetime.now() - cached_data['timestamp'] < self.cache_duration:
+                    return cached_data['sentiment']
+            
+            # Get tweets
+            tweets = self.twitter_api.search_tweets(
+                q=f"${symbol}",
+                lang="en",
+                count=100
+            )
+            
+            if not tweets:
+                return None
+            
+            # Analyze sentiment of each tweet
+            sentiments = []
+            for tweet in tweets:
+                sentiment = self.analyze_text(tweet.text)
+                sentiments.append(sentiment)
+            
+            # Calculate weighted average sentiment
+            avg_sentiment = np.mean(sentiments)
+            
+            # Cache the result
+            self.sentiment_cache[cache_key] = {
+                'sentiment': avg_sentiment,
+                'timestamp': datetime.now()
+            }
+            
+            return avg_sentiment
+            
+        except Exception as e:
+            logger.error(f"Error getting Twitter sentiment: {str(e)}")
+            return None
+    
+    def get_market_sentiment(self, symbol: str) -> Optional[float]:
+        """
+        Get market sentiment indicators
+        """
+        try:
+            # Check cache first
+            cache_key = f"market_{symbol}"
+            if cache_key in self.sentiment_cache:
+                cached_data = self.sentiment_cache[cache_key]
+                if datetime.now() - cached_data['timestamp'] < self.cache_duration:
+                    return cached_data['sentiment']
+            
+            # Get market data
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            
+            # Calculate various sentiment indicators
+            sentiment_indicators = []
+            
+            # RSI sentiment
+            if 'RSI' in info:
+                rsi = info['RSI']
+                rsi_sentiment = (rsi - 50) / 50  # Normalize to [-1, 1]
+                sentiment_indicators.append(rsi_sentiment)
+            
+            # Volume sentiment
+            if 'volume' in info and 'averageVolume' in info:
+                volume_ratio = info['volume'] / info['averageVolume']
+                volume_sentiment = (volume_ratio - 1) / volume_ratio  # Normalize to [-1, 1]
+                sentiment_indicators.append(volume_sentiment)
+            
+            # Price momentum sentiment
+            if 'regularMarketChangePercent' in info:
+                momentum_sentiment = info['regularMarketChangePercent'] / 100
+                sentiment_indicators.append(momentum_sentiment)
+            
+            if not sentiment_indicators:
+                return None
+            
+            # Calculate weighted average sentiment
+            avg_sentiment = np.mean(sentiment_indicators)
+            
+            # Cache the result
+            self.sentiment_cache[cache_key] = {
+                'sentiment': avg_sentiment,
+                'timestamp': datetime.now()
+            }
+            
+            return avg_sentiment
+            
+        except Exception as e:
+            logger.error(f"Error getting market sentiment: {str(e)}")
+            return None
+    
+    def get_combined_sentiment(self, symbol: str) -> Optional[float]:
+        """
+        Get combined sentiment from all sources
+        """
+        try:
+            # Check cache first
+            cache_key = f"combined_{symbol}"
+            if cache_key in self.sentiment_cache:
+                cached_data = self.sentiment_cache[cache_key]
+                if datetime.now() - cached_data['timestamp'] < self.cache_duration:
+                    return cached_data['sentiment']
+            
+            # Get sentiment from all sources
+            sentiments = []
+            weights = []
+            
+            # News sentiment
+            news_sentiment = self.get_news_sentiment(symbol)
+            if news_sentiment is not None:
+                sentiments.append(news_sentiment)
+                weights.append(self.config['sentiment_weights']['news'])
+            
+            # Twitter sentiment
+            twitter_sentiment = self.get_twitter_sentiment(symbol)
+            if twitter_sentiment is not None:
+                sentiments.append(twitter_sentiment)
+                weights.append(self.config['sentiment_weights']['twitter'])
+            
+            # Market sentiment
+            market_sentiment = self.get_market_sentiment(symbol)
+            if market_sentiment is not None:
+                sentiments.append(market_sentiment)
+                weights.append(self.config['sentiment_weights']['market'])
+            
+            if not sentiments:
+                return None
+            
+            # Calculate weighted average sentiment
+            avg_sentiment = np.average(sentiments, weights=weights)
+            
+            # Cache the result
+            self.sentiment_cache[cache_key] = {
+                'sentiment': avg_sentiment,
+                'timestamp': datetime.now()
+            }
+            
+            return avg_sentiment
+            
+        except Exception as e:
+            logger.error(f"Error getting combined sentiment: {str(e)}")
+            return None
+    
+    def clear_cache(self):
+        """
+        Clear the sentiment cache
+        """
+        self.sentiment_cache.clear()
+    
+    def get_sentiment_signal(self, symbol: str) -> int:
+        """
+        Convert sentiment to trading signal
+        """
+        sentiment = self.get_combined_sentiment(symbol)
+        if sentiment is None:
+            return 0
+        
+        # Define sentiment thresholds
+        positive_threshold = self.config['sentiment_thresholds']['positive']
+        negative_threshold = self.config['sentiment_thresholds']['negative']
+        
+        if sentiment > positive_threshold:
+            return 1  # Buy signal
+        elif sentiment < negative_threshold:
+            return -1  # Sell signal
+        else:
+            return 0  # Neutral signal 
+            import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from typing import Dict, List
+import json
+import os
+
+def plot_backtest_results(results_file: str, save_path: str = None):
+    """
+    Create interactive plots for backtest results
+    """
+    # Load results
+    with open(results_file, 'r') as f:
+        results = json.load(f)
+    
+    # Convert data to DataFrames
+    trades_df = pd.DataFrame(results['trades'])
+    equity_df = pd.DataFrame(results['equity_curve'])
+    
+    # Create figure with secondary y-axis
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=('Price and Trades', 'Equity Curve'),
+        row_heights=[0.7, 0.3]
+    )
+    
+    # Add price line
+    fig.add_trace(
+        go.Scatter(
+            x=trades_df['timestamp'],
+            y=trades_df['price'],
+            name='Price',
+            line=dict(color='blue')
+        ),
+        row=1, col=1
+    )
+    
+    # Add buy trades
+    buy_trades = trades_df[trades_df['action'] == 'buy']
+    fig.add_trace(
+        go.Scatter(
+            x=buy_trades['timestamp'],
+            y=buy_trades['price'],
+            mode='markers',
+            name='Buy',
+            marker=dict(color='green', size=10)
+        ),
+        row=1, col=1
+    )
+    
+    # Add sell trades
+    sell_trades = trades_df[trades_df['action'] == 'sell']
+    fig.add_trace(
+        go.Scatter(
+            x=sell_trades['timestamp'],
+            y=sell_trades['price'],
+            mode='markers',
+            name='Sell',
+            marker=dict(color='red', size=10)
+        ),
+        row=1, col=1
+    )
+    
+    # Add equity curve
+    fig.add_trace(
+        go.Scatter(
+            x=equity_df['timestamp'],
+            y=equity_df['equity'],
+            name='Equity',
+            line=dict(color='purple')
+        ),
+        row=2, col=1
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title='Backtest Results',
+        xaxis_title='Date',
+        yaxis_title='Price',
+        yaxis2_title='Equity',
+        showlegend=True,
+        height=800
+    )
+    
+    # Save plot if path is provided
+    if save_path:
+        fig.write_html(save_path)
+        print(f"Plot saved to {save_path}")
+    
+    return fig
+
+def plot_performance_metrics(results_files: List[str], save_path: str = None):
+    """
+    Create comparison plot of performance metrics across different scenarios
+    """
+    metrics_data = []
+    
+    for file in results_files:
+        with open(file, 'r') as f:
+            results = json.load(f)
+            metrics = results['performance_metrics']
+            
+            # Extract scenario name from filename
+            scenario_name = os.path.basename(file).replace('backtest_results_', '').replace('.json', '')
+            
+            metrics_data.append({
+                'Scenario': scenario_name,
+                'Total Return': metrics['total_return'],
+                'Annual Return': metrics['annual_return'],
+                'Sharpe Ratio': metrics['sharpe_ratio'],
+                'Max Drawdown': metrics['max_drawdown'],
+                'Win Rate': metrics['win_rate']
+            })
+    
+    # Create DataFrame
+    df = pd.DataFrame(metrics_data)
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add bars for each metric
+    metrics = ['Total Return', 'Annual Return', 'Sharpe Ratio', 'Max Drawdown', 'Win Rate']
+    for metric in metrics:
+        fig.add_trace(
+            go.Bar(
+                name=metric,
+                x=df['Scenario'],
+                y=df[metric]
+            )
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title='Performance Metrics Comparison',
+        xaxis_title='Scenario',
+        yaxis_title='Value',
+        barmode='group',
+        height=600
+    )
+    
+    # Save plot if path is provided
+    if save_path:
+        fig.write_html(save_path)
+        print(f"Plot saved to {save_path}")
+    
+    return fig
+
+def main():
+    # Example usage
+    results_dir = 'backtest_results'
+    results_files = [
+        os.path.join(results_dir, f) for f in os.listdir(results_dir)
+        if f.startswith('backtest_results_') and f.endswith('.json')
+    ]
+    
+    # Create plots for each scenario
+    for file in results_files:
+        scenario_name = os.path.basename(file).replace('.json', '')
+        plot_path = os.path.join(results_dir, f'{scenario_name}_plot.html')
+        plot_backtest_results(file, plot_path)
+    
+    # Create comparison plot
+    comparison_path = os.path.join(results_dir, 'performance_comparison.html')
+    plot_performance_metrics(results_files, comparison_path)
+
+if __name__ == "__main__":
+    main() 
+    import os
+import sys
+from datetime import datetime, timedelta
+import logging
+from src.backtesting import Backtester
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('backtest.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+def run_backtest_scenarios():
+    # Load configuration
+    config_path = os.path.join(os.path.dirname(__file__), 'config', 'config.json')
+    
+    # Create backtester
+    backtester = Backtester(config_path)
+    
+    # Define test scenarios
+    scenarios = [
+        {
+            'name': 'BTC/USDT 1h - Last 30 days',
+            'symbol': 'BTC/USDT',
+            'timeframe': '1h',
+            'days': 30
+        },
+        {
+            'name': 'ETH/USDT 4h - Last 60 days',
+            'symbol': 'ETH/USDT',
+            'timeframe': '4h',
+            'days': 60
+        },
+        {
+            'name': 'BTC/USDT 1d - Last 90 days',
+            'symbol': 'BTC/USDT',
+            'timeframe': '1d',
+            'days': 90
+        }
+    ]
+    
+    # Run each scenario
+    for scenario in scenarios:
+        logger.info(f"\nRunning scenario: {scenario['name']}")
+        
+        # Calculate date range
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=scenario['days'])
+        
+        # Run backtest
+        results = backtester.run_backtest(
+            symbol=scenario['symbol'],
+            timeframe=scenario['timeframe'],
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=50.0
+        )
+        
+        if results:
+            # Print performance metrics
+            metrics = results['performance_metrics']
+            print(f"\nResults for {scenario['name']}:")
+            print(f"Total Trades: {metrics['total_trades']}")
+            print(f"Win Rate: {metrics['win_rate']:.2%}")
+            print(f"Total Return: {metrics['total_return']:.2%}")
+            print(f"Annual Return: {metrics['annual_return']:.2%}")
+            print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+            print(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
+            
+            # Save results
+            filename = f"backtest_results_{scenario['symbol'].replace('/', '_')}_{scenario['timeframe']}.json"
+            backtester.save_results(filename)
+            logger.info(f"Results saved to {filename}")
+        else:
+            logger.error(f"Backtest failed for scenario: {scenario['name']}")
+
+if __name__ == "__main__":
+    run_backtest_scenarios() 
+    import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import logging
+from typing import Dict, List, Optional
+import ccxt
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+
+from .trading_strategy import TradingStrategy
+from .config import load_config
+
+logger = logging.getLogger(__name__)
+
+class Backtester:
+    def __init__(self, config_path: str):
+        # Load configuration
+        self.config = load_config(config_path)
+        
+        # Initialize exchange
+        self.exchange = self._initialize_exchange()
+        
+        # Initialize trading strategy
+        self.strategy = TradingStrategy(self.config)
+        
+        # Initialize results storage
+        self.results = {
+            'trades': [],
+            'equity_curve': [],
+            'performance_metrics': {}
+        }
+    
+    def _initialize_exchange(self) -> ccxt.Exchange:
+        """Initialize the cryptocurrency exchange"""
+        try:
+            exchange_class = getattr(ccxt, self.config['exchange']['name'])
+            exchange = exchange_class({
+                'apiKey': self.config['exchange']['api_key'],
+                'secret': self.config['exchange']['api_secret'],
+                'enableRateLimit': True
+            })
+            
+            # Test connection
+            exchange.load_markets()
+            logger.info(f"Successfully connected to {self.config['exchange']['name']}")
+            
+            return exchange
+            
+        except Exception as e:
+            logger.error(f"Error initializing exchange: {str(e)}")
+            raise
+    
+    def fetch_historical_data(self, 
+                            symbol: str, 
+                            timeframe: str, 
+                            start_date: datetime,
+                            end_date: datetime) -> pd.DataFrame:
+        """Fetch historical market data"""
+        try:
+            # Convert dates to timestamps
+            start_timestamp = int(start_date.timestamp() * 1000)
+            end_timestamp = int(end_date.timestamp() * 1000)
+            
+            # Fetch OHLCV data
+            ohlcv = self.exchange.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                since=start_timestamp,
+                limit=1000  # Maximum limit per request
+            )
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {symbol}: {str(e)}")
+            return None
+    
+    def run_backtest(self, 
+                    symbol: str,
+                    timeframe: str,
+                    start_date: datetime,
+                    end_date: datetime,
+                    initial_capital: float = 50.0) -> Dict:
+        """Run backtest for a given period"""
+        try:
+            logger.info(f"Starting backtest for {symbol} from {start_date} to {end_date}")
+            
+            # Fetch historical data
+            df = self.fetch_historical_data(symbol, timeframe, start_date, end_date)
+            if df is None:
+                raise ValueError("Failed to fetch historical data")
+            
+            # Initialize variables
+            current_capital = initial_capital
+            position = 0
+            entry_price = 0
+            trades = []
+            equity_curve = []
+            
+            # Iterate through data
+            for i in range(len(df)):
+                current_data = df.iloc[:i+1]
+                current_price = current_data['close'].iloc[-1]
+                
+                # Generate trading signal
+                signal = self.strategy.analyze_market(symbol, current_data)
+                
+                if signal:
+                    # Execute trade if conditions are met
+                    if signal.action == 'buy' and position <= 0:
+                        position = 1
+                        entry_price = current_price
+                        trades.append({
+                            'timestamp': current_data.index[-1],
+                            'action': 'buy',
+                            'price': current_price,
+                            'position_size': signal.position_size
+                        })
+                    
+                    elif signal.action == 'sell' and position >= 0:
+                        position = -1
+                        entry_price = current_price
+                        trades.append({
+                            'timestamp': current_data.index[-1],
+                            'action': 'sell',
+                            'price': current_price,
+                            'position_size': signal.position_size
+                        })
+                
+                # Update position PnL
+                if position != 0:
+                    pnl = position * (current_price - entry_price) * signal.position_size
+                    current_capital += pnl
+                
+                # Record equity
+                equity_curve.append({
+                    'timestamp': current_data.index[-1],
+                    'equity': current_capital
+                })
+            
+            # Calculate performance metrics
+            self.results['trades'] = trades
+            self.results['equity_curve'] = equity_curve
+            self.results['performance_metrics'] = self._calculate_performance_metrics(trades)
+            
+            return self.results
+            
+        except Exception as e:
+            logger.error(f"Error running backtest: {str(e)}")
+            return None
+    
+    def _calculate_performance_metrics(self, trades: List[Dict]) -> Dict:
+        """Calculate performance metrics from trades"""
+        if not trades:
+            return {}
+        
+        # Convert trades to DataFrame
+        df = pd.DataFrame(trades)
+        
+        # Calculate basic metrics
+        total_trades = len(df)
+        winning_trades = len(df[df['action'] == 'buy'])
+        losing_trades = len(df[df['action'] == 'sell'])
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        # Calculate returns
+        returns = df['price'].pct_change()
+        total_return = (1 + returns).prod() - 1
+        annual_return = (1 + total_return) ** (252 / len(df)) - 1
+        
+        # Calculate risk metrics
+        volatility = returns.std() * np.sqrt(252)
+        sharpe_ratio = annual_return / volatility if volatility > 0 else 0
+        
+        # Calculate drawdown
+        cumulative_returns = (1 + returns).cumprod()
+        rolling_max = cumulative_returns.expanding().max()
+        drawdowns = (cumulative_returns - rolling_max) / rolling_max
+        max_drawdown = drawdowns.min()
+        
+        return {
+            'total_trades': total_trades,
+            'winning_trades': winning_trades,
+            'losing_trades': losing_trades,
+            'win_rate': win_rate,
+            'total_return': total_return,
+            'annual_return': annual_return,
+            'volatility': volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown
+        }
+    
+    def save_results(self, filepath: str):
+        """Save backtest results to file"""
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(self.results, f, default=str)
+            logger.info(f"Backtest results saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving results: {str(e)}")
+            return False
+    
+    def load_results(self, filepath: str):
+        """Load backtest results from file"""
+        try:
+            with open(filepath, 'r') as f:
+                self.results = json.load(f)
+            logger.info(f"Backtest results loaded from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading results: {str(e)}")
+            return False
+
+def main():
+    # Load configuration
+    config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.json')
+    
+    # Create backtester
+    backtester = Backtester(config_path)
+    
+    # Define backtest parameters
+    symbol = "BTC/USDT"
+    timeframe = "1h"
+    start_date = datetime.now() - timedelta(days=30)
+    end_date = datetime.now()
+    initial_capital = 50.0
+    
+    # Run backtest
+    results = backtester.run_backtest(
+        symbol=symbol,
+        timeframe=timeframe,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital
+    )
+    
+    if results:
+        # Print performance metrics
+        metrics = results['performance_metrics']
+        print("\nBacktest Results:")
+        print(f"Total Trades: {metrics['total_trades']}")
+        print(f"Win Rate: {metrics['win_rate']:.2%}")
+        print(f"Total Return: {metrics['total_return']:.2%}")
+        print(f"Annual Return: {metrics['annual_return']:.2%}")
+        print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+        print(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
+        
+        # Save results
+        backtester.save_results('backtest_results.json')
+    else:
+        print("Backtest failed to complete")
+
+if __name__ == "__main__":
+    main() 
+    # Core dependencies
+numpy==1.24.3
+pandas==2.0.3
+scipy==1.10.1
+scikit-learn==1.3.0
+
+# Deep Learning
+torch==2.0.1
+tensorflow==2.13.0
+keras==2.13.1
+transformers==4.31.0
+
+# Reinforcement Learning
+gym==0.26.2
+stable-baselines3==2.0.0
+
+# Trading & Financial
+ccxt==4.0.0
+ta==0.10.2
+yfinance==0.2.28
+pandas-ta==0.3.14b0
+
+# Data Processing & Analysis
+statsmodels==0.14.0
+pyfolio==0.9.2
+empyrical==0.5.5
+
+# Sentiment Analysis
+textblob==0.17.1
+vaderSentiment==3.3.2
+newsapi-python==0.2.7
+tweepy==4.14.0
+praw==7.7.1
+
+# Web Dashboard
+dash==2.11.1
+dash-bootstrap-components==1.4.1
+plotly==5.15.0
+
+# System Monitoring
+psutil==5.9.5
+py-cpuinfo==9.0.0
+
+# Code Analysis
+pylint==2.17.5
+astroid==2.15.6
+radon==6.0.1
+
+# Utilities
+python-dotenv==1.0.0
+requests==2.31.0
+websockets==11.0.3
+aiohttp==3.8.5
+schedule==1.2.0
+
+# Testing
+pytest==7.4.0
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Documentation
+sphinx==7.1.2
+sphinx-rtd-theme==1.2.2
+
+# Development Tools
+black==23.7.0
+isort==5.12.0
+mypy==1.5.1
+pre-commit==3.3.3 
+{
+    "system": {
+        "name": "Quantum Edge System",
+        "version": "1.0.0",
+        "log_level": "INFO",
+        "dashboard_port": 8050
+    },
+    "trading": {
+        "exchange": {
+            "name": "binance",
+            "testnet": true,
+            "api_key": "YOUR_API_KEY",
+            "api_secret": "YOUR_API_SECRET"
+        },
+        "markets": ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD"],
+        "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"],
+        "default_leverage": 1.0,
+        "position_types": ["long", "short"],
+        "order_types": ["market", "limit", "stop_loss", "take_profit"]
+    },
+    "ml_model": {
+        "default_type": "lstm",
+        "lstm": {
+            "layers": [64, 32],
+            "dropout": 0.2,
+            "learning_rate": 0.001,
+            "batch_size": 32,
+            "epochs": 100,
+            "validation_split": 0.2,
+            "sequence_length": 60
+        },
+        "reinforcement": {
+            "model_type": "ppo",
+            "policy_network": [64, 64],
+            "value_network": [64, 32],
+            "learning_rate": 0.0003,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_ratio": 0.2,
+            "train_iterations": 80
+        },
+        "features": {
+            "price": ["open", "high", "low", "close"],
+            "volume": ["volume", "taker_buy_volume"],
+            "technical": [
+                "rsi", "macd", "bollinger_bands",
+                "moving_averages", "momentum", "volatility"
+            ]
+        }
+    },
+    "risk_management": {
+        "position_sizing": {
+            "max_position_size": 0.1,
+            "max_leverage": 3.0,
+            "min_position_size": 0.01
+        },
+        "risk_limits": {
+            "max_drawdown": 0.2,
+            "var_limit": 0.05,
+            "min_sharpe": 1.0,
+            "max_correlation": 0.7
+        },
+        "stop_loss": {
+            "default_percentage": 0.02,
+            "trailing_stop": true,
+            "activation_percentage": 0.01
+        },
+        "take_profit": {
+            "default_percentage": 0.03,
+            "trailing_take_profit": true,
+            "activation_percentage": 0.015
+        },
+        "exposure_limits": {
+            "max_total_exposure": 1.0,
+            "max_single_market": 0.3,
+            "max_correlated_exposure": 0.5
+        }
+    },
+    "sentiment_analysis": {
+        "providers": {
+            "news": {
+                "api_key": "YOUR_NEWS_API_KEY",
+                "sources": ["reuters", "bloomberg", "coindesk"],
+                "update_interval": 300
+            },
+            "social": {
+                "twitter_api_key": "YOUR_TWITTER_API_KEY",
+                "twitter_api_secret": "YOUR_TWITTER_API_SECRET",
+                "reddit_client_id": "YOUR_REDDIT_CLIENT_ID",
+                "reddit_client_secret": "YOUR_REDDIT_CLIENT_SECRET",
+                "update_interval": 60
+            }
+        },
+        "analysis": {
+            "sentiment_window": 3600,
+            "min_confidence": 0.6,
+            "impact_threshold": 0.3,
+            "correlation_threshold": 0.5
+        }
+    },
+    "optimization": {
+        "system": {
+            "cpu_threshold": 80,
+            "memory_threshold": 80,
+            "network_latency_threshold": 1000,
+            "optimization_interval": 3600
+        },
+        "trading": {
+            "min_win_rate": 0.55,
+            "min_profit_factor": 1.5,
+            "max_drawdown": 0.2,
+            "optimization_lookback": 1000
+        },
+        "ml_model": {
+            "min_accuracy": 0.6,
+            "min_sharpe": 1.0,
+            "max_drawdown": 0.15,
+            "retraining_interval": 86400
+        }
+    },
+    "monitoring": {
+        "metrics_update_interval": 60,
+        "health_check_interval": 300,
+        "alert_thresholds": {
+            "cpu_usage": 90,
+            "memory_usage": 90,
+            "api_latency": 2000,
+            "error_rate": 0.01
+        },
+        "performance_thresholds": {
+            "min_daily_profit": -0.02,
+            "max_daily_loss": -0.05,
+            "min_win_rate": 0.5,
+            "min_profit_factor": 1.2
+        }
+    }
+} 
+import logging
+import threading
+import queue
+import json
+import os
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+import time
+import numpy as np
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
+import traceback
+import signal
+import sys
+from .trading_system import TradingSystem, create_trading_system
+from .code_guardian import CodeGuardian, create_guardian
+from .system_monitor import SystemMonitor
+from .dashboard import create_dashboard
+from .risk_management import RiskManager, RiskMetrics
+from .sentiment_analysis import SentimentAnalyzer
+from .machine_learning_model import MachineLearningModel
+from .trading_environment import TradingEnvironment
+
+# Configure logging with rotation
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            'logs/quantum_edge_system.log',
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5
+        ),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0):
+    """Decorator for retrying failed operations"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(delay * (attempt + 1))  # Exponential backoff
+            logger.error(f"All {max_retries} attempts failed. Last error: {str(last_exception)}")
+            raise last_exception
+        return wrapper
+    return decorator
+
+@dataclass
+class SystemHealth:
+    """System health metrics"""
+    cpu_usage: float
+    memory_usage: float
+    network_latency: float
+    disk_usage: float
+    error_rate: float
+    last_check: datetime
+
+@dataclass
+class QuantumBotInstance:
+    """Represents a Quantum Edge trading bot instance"""
+    bot_id: str
+    trading_system: TradingSystem
+    ml_model: MachineLearningModel
+    risk_manager: RiskManager
+    sentiment_analyzer: SentimentAnalyzer
+    trading_env: TradingEnvironment
+    config: Dict
+    status: str
+    last_update: datetime
+    performance_metrics: Dict
+    message_queue: queue.Queue
+    health_metrics: SystemHealth
+    error_count: int
+    recovery_attempts: int
+    last_error: Optional[Exception] = None
+
+class QuantumEdgeSystem:
+    def __init__(self, project_root: str, config_path: str):
+        """Initialize the Quantum Edge System"""
+        self.project_root = project_root
+        self.load_config(config_path)
+        self.bots: Dict[str, QuantumBotInstance] = {}
+        self.code_guardian = create_guardian(project_root)
+        self.system_monitor = SystemMonitor(project_root)
+        self.message_queue = queue.Queue()
+        self.running = True
+        self.thread_pool = ThreadPoolExecutor(max_workers=10)
+        self.error_threshold = self.config['monitoring']['alert_thresholds']['error_rate']
+        self.recovery_threshold = 3
+
+        # Initialize system components
+        self._init_system_components()
+        self._start_management_threads()
+        self._init_dashboard()
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+
+    def _handle_shutdown(self, signum, frame):
+        """Handle system shutdown signals"""
+        logger.info(f"Received shutdown signal {signum}")
+        self.stop()
+
+    @retry_on_failure(max_retries=3, delay=2.0)
+    def load_config(self, config_path: str):
+        """Load system configuration with retry"""
+        try:
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+            self.validate_config()
+        except Exception as e:
+            logger.error(f"Error loading config: {str(e)}")
+            raise
+
+    def validate_config(self):
+        """Validate system configuration with detailed checks"""
+        required_sections = ['trading', 'ml_model', 'risk_management', 'sentiment_analysis']
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"Missing required config section: {section}")
+            
+            # Validate section-specific requirements
+            if section == 'trading':
+                self._validate_trading_config()
+            elif section == 'ml_model':
+                self._validate_ml_config()
+            elif section == 'risk_management':
+                self._validate_risk_config()
+            elif section == 'sentiment_analysis':
+                self._validate_sentiment_config()
+
+    def _validate_trading_config(self):
+        """Validate trading configuration"""
+        trading_config = self.config['trading']
+        required_fields = ['exchange', 'markets', 'timeframes']
+        for field in required_fields:
+            if field not in trading_config:
+                raise ValueError(f"Missing required trading config field: {field}")
+        
+        if not trading_config['markets']:
+            raise ValueError("No trading markets specified")
+        
+        if not trading_config['timeframes']:
+            raise ValueError("No timeframes specified")
+
+    def _validate_ml_config(self):
+        """Validate ML configuration"""
+        ml_config = self.config['ml_model']
+        if 'default_type' not in ml_config:
+            raise ValueError("ML model default type not specified")
+        
+        if ml_config['default_type'] not in ['lstm', 'reinforcement']:
+            raise ValueError(f"Invalid ML model type: {ml_config['default_type']}")
+
+    def _validate_risk_config(self):
+        """Validate risk management configuration"""
+        risk_config = self.config['risk_management']
+        required_sections = ['position_sizing', 'risk_limits', 'stop_loss']
+        for section in required_sections:
+            if section not in risk_config:
+                raise ValueError(f"Missing required risk config section: {section}")
+
+    def _validate_sentiment_config(self):
+        """Validate sentiment analysis configuration"""
+        sentiment_config = self.config['sentiment_analysis']
+        if 'providers' not in sentiment_config:
+            raise ValueError("Sentiment analysis providers not specified")
+
+    def _init_system_components(self):
+        """Initialize system-wide components with error handling"""
+        try:
+            self.global_risk_manager = RiskManager(self.config['risk_management'])
+            self.global_sentiment_analyzer = SentimentAnalyzer(self.config['sentiment_analysis'])
+            self.performance_tracker = self._init_performance_tracker()
+            self.health_metrics = SystemHealth(
+                cpu_usage=0.0,
+                memory_usage=0.0,
+                network_latency=0.0,
+                disk_usage=0.0,
+                error_rate=0.0,
+                last_check=datetime.now()
+            )
+        except Exception as e:
+            logger.error(f"Error initializing system components: {str(e)}")
+            raise
+
+    def _init_performance_tracker(self):
+        """Initialize system-wide performance tracking with enhanced metrics"""
+        return {
+            'system_metrics': {},
+            'bot_metrics': {},
+            'risk_metrics': {},
+            'sentiment_metrics': {},
+            'ml_metrics': {},
+            'error_metrics': {
+                'total_errors': 0,
+                'error_types': {},
+                'recovery_success_rate': 1.0
+            },
+            'performance_metrics': {
+                'average_latency': 0.0,
+                'throughput': 0.0,
+                'resource_utilization': {}
+            }
+        }
+
+    def _start_management_threads(self):
+        """Start system management threads with enhanced monitoring"""
+        self.threads = {
+            'monitor': threading.Thread(target=self._monitor_system),
+            'message_handler': threading.Thread(target=self._handle_messages),
+            'code_repair': threading.Thread(target=self._continuous_code_repair),
+            'performance_tracker': threading.Thread(target=self._track_performance),
+            'risk_monitor': threading.Thread(target=self._monitor_risk),
+            'sentiment_monitor': threading.Thread(target=self._monitor_sentiment),
+            'health_checker': threading.Thread(target=self._check_system_health)
+        }
+        
+        for thread_name, thread in self.threads.items():
+            thread.daemon = True
+            thread.name = f"quantum_edge_{thread_name}"
+            thread.start()
+            logger.info(f"Started thread: {thread_name}")
+
+    def _check_system_health(self):
+        """Continuously check system health"""
+        while self.running:
+            try:
+                health_metrics = {
+                    'cpu_usage': self.system_monitor.get_cpu_usage(),
+                    'memory_usage': self.system_monitor.get_memory_usage(),
+                    'network_latency': self.system_monitor.get_network_latency(),
+                    'disk_usage': self.system_monitor.get_disk_usage(),
+                    'error_rate': self._calculate_error_rate()
+                }
+                
+                self.health_metrics = SystemHealth(
+                    **health_metrics,
+                    last_check=datetime.now()
+                )
+                
+                if self._is_system_unhealthy():
+                    self._handle_system_health_issue()
+                
+                time.sleep(60)
+                
+            except Exception as e:
+                logger.error(f"Error checking system health: {str(e)}")
+                time.sleep(300)
+
+    def _calculate_error_rate(self) -> float:
+        """Calculate system-wide error rate"""
+        total_errors = sum(bot.error_count for bot in self.bots.values())
+        total_operations = sum(bot.performance_metrics.get('total_operations', 0) 
+                             for bot in self.bots.values())
+        return total_errors / total_operations if total_operations > 0 else 0.0
+
+    def _is_system_unhealthy(self) -> bool:
+        """Determine if system is unhealthy"""
+        thresholds = self.config['monitoring']['alert_thresholds']
+        return (
+            self.health_metrics.cpu_usage > thresholds['cpu_usage'] or
+            self.health_metrics.memory_usage > thresholds['memory_usage'] or
+            self.health_metrics.network_latency > thresholds['api_latency'] or
+            self.health_metrics.error_rate > thresholds['error_rate']
+        )
+
+    def _handle_system_health_issue(self):
+        """Handle system health issues"""
+        logger.warning("System health issues detected")
+        
+        # Reduce system load
+        self._optimize_system_performance()
+        
+        # Notify all bots
+        self.broadcast_message({
+            'type': 'system_alert',
+            'action': 'reduce_load',
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Log health metrics
+        logger.warning(f"Current health metrics: {self.health_metrics}")
+
+    @retry_on_failure(max_retries=3, delay=2.0)
+    def create_quantum_bot(self, config: Dict) -> str:
+        """Create a new Quantum Edge bot instance with enhanced error handling"""
+        try:
+            bot_id = f"quantum_bot_{len(self.bots) + 1}"
+            
+            # Create bot-specific config
+            bot_config = self._create_bot_config(config)
+            config_path = os.path.join(self.project_root, 'config', f'{bot_id}_config.json')
+            
+            # Save config with retry
+            self._save_bot_config(config_path, bot_config)
+            
+            # Initialize bot components with parallel execution
+            components = self._initialize_bot_components(bot_config)
+            
+            # Create bot instance with health monitoring
+            bot = QuantumBotInstance(
+                bot_id=bot_id,
+                trading_system=components['trading_system'],
+                ml_model=components['ml_model'],
+                risk_manager=components['risk_manager'],
+                sentiment_analyzer=components['sentiment_analyzer'],
+                trading_env=components['trading_env'],
+                config=bot_config,
+                status='initialized',
+                last_update=datetime.now(),
+                performance_metrics={},
+                message_queue=queue.Queue(),
+                health_metrics=SystemHealth(
+                    cpu_usage=0.0,
+                    memory_usage=0.0,
+                    network_latency=0.0,
+                    disk_usage=0.0,
+                    error_rate=0.0,
+                    last_check=datetime.now()
+                ),
+                error_count=0,
+                recovery_attempts=0
+            )
+            
+            self.bots[bot_id] = bot
+            logger.info(f"Created new Quantum Edge bot instance: {bot_id}")
+            
+            return bot_id
+            
+        except Exception as e:
+            logger.error(f"Error creating Quantum Edge bot: {str(e)}")
+            raise
+
+    def _save_bot_config(self, config_path: str, config: Dict):
+        """Save bot configuration with retry"""
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving bot config: {str(e)}")
+            raise
+
+    def _initialize_bot_components(self, config: Dict) -> Dict:
+        """Initialize bot components in parallel"""
+        components = {}
+        futures = {
+            'trading_system': self.thread_pool.submit(
+                create_trading_system, config['trading']
+            ),
+            'ml_model': self.thread_pool.submit(
+                MachineLearningModel, config['ml_model']
+            ),
+            'risk_manager': self.thread_pool.submit(
+                RiskManager, config['risk_management']
+            ),
+            'sentiment_analyzer': self.thread_pool.submit(
+                SentimentAnalyzer, config['sentiment_analysis']
+            ),
+            'trading_env': self.thread_pool.submit(
+                TradingEnvironment, config['trading']
+            )
+        }
+        
+        for name, future in futures.items():
+            try:
+                components[name] = future.result()
+            except Exception as e:
+                logger.error(f"Error initializing {name}: {str(e)}")
+                raise
+        
+        return components
+
+    def start_bot(self, bot_id: str):
+        """Start a Quantum Edge bot with enhanced error handling"""
+        if bot_id in self.bots:
+            try:
+                bot = self.bots[bot_id]
+                
+                # Initialize components with retry
+                self._initialize_bot_components_with_retry(bot)
+                
+                # Start bot with health monitoring
+                bot.status = 'running'
+                bot.last_update = datetime.now()
+                
+                logger.info(f"Started Quantum Edge bot: {bot_id}")
+                
+                # Send start message to bot
+                self._send_message_to_bot(bot_id, {
+                    'type': 'command',
+                    'action': 'start',
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+            except Exception as e:
+                logger.error(f"Error starting Quantum Edge bot {bot_id}: {str(e)}")
+                self._handle_bot_error(bot_id, e)
+
+    def _initialize_bot_components_with_retry(self, bot: QuantumBotInstance):
+        """Initialize bot components with retry mechanism"""
+        try:
+            bot.ml_model.initialize()
+            bot.trading_env.reset()
+            bot.trading_system.start()
+        except Exception as e:
+            logger.error(f"Error initializing bot components: {str(e)}")
+            bot.error_count += 1
+            bot.last_error = e
+            raise
+
+    def _handle_bot_error(self, bot_id: str, error: Exception):
+        """Handle bot errors with recovery mechanism"""
+        bot = self.bots[bot_id]
+        bot.error_count += 1
+        bot.last_error = error
+        
+        if bot.error_count >= self.recovery_threshold:
+            logger.warning(f"Bot {bot_id} exceeded error threshold, attempting recovery")
+            self._attempt_bot_recovery(bot_id)
+        else:
+            bot.status = 'error'
+            logger.error(f"Bot {bot_id} encountered error: {str(error)}")
+
+    def _attempt_bot_recovery(self, bot_id: str):
+        """Attempt to recover a failed bot"""
+        bot = self.bots[bot_id]
+        try:
+            # Reset bot state
+            bot.error_count = 0
+            bot.recovery_attempts += 1
+            
+            # Reinitialize components
+            self._initialize_bot_components_with_retry(bot)
+            
+            # Restart bot
+            bot.status = 'running'
+            logger.info(f"Successfully recovered bot {bot_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to recover bot {bot_id}: {str(e)}")
+            bot.status = 'failed'
+            self._handle_critical_bot_failure(bot_id)
+
+    def _handle_critical_bot_failure(self, bot_id: str):
+        """Handle critical bot failures"""
+        logger.error(f"Critical failure for bot {bot_id}")
+        
+        # Notify system
+        self.message_queue.put({
+            'type': 'critical_error',
+            'bot_id': bot_id,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Update system metrics
+        self.performance_tracker['error_metrics']['total_errors'] += 1
+        error_type = type(self.bots[bot_id].last_error).__name__
+        self.performance_tracker['error_metrics']['error_types'][error_type] = \
+            self.performance_tracker['error_metrics']['error_types'].get(error_type, 0) + 1
+
+    def stop(self):
+        """Stop the Quantum Edge System with graceful shutdown"""
+        logger.info("Initiating system shutdown")
+        self.running = False
+        
+        # Stop all bots gracefully
+        for bot_id in self.bots:
+            self.stop_bot(bot_id)
+        
+        # Stop components
+        self.code_guardian.stop()
+        self.system_monitor.stop()
+        
+        # Shutdown thread pool
+        self.thread_pool.shutdown(wait=True)
+        
+        # Wait for threads
+        for thread_name, thread in self.threads.items():
+            if thread.is_alive():
+                logger.info(f"Waiting for thread {thread_name} to finish")
+                thread.join(timeout=30)
+                if thread.is_alive():
+                    logger.warning(f"Thread {thread_name} did not terminate gracefully")
+        
+        logger.info("Quantum Edge System stopped")
+
+def create_quantum_edge_system(project_root: str, config_path: str) -> QuantumEdgeSystem:
+    """Create and initialize a Quantum Edge System"""
+    return QuantumEdgeSystem(project_root, config_path)
+
+if __name__ == "__main__":
+    # Example usage with enhanced error handling
+    config_path = "config/quantum_edge_config.json"
+    system = None
+    
+    try:
+        system = create_quantum_edge_system(".", config_path)
+        
+        # Create test bots with different strategies
+        configs = [
+            {
+                "trading": {
+                    "initial_capital": 100000,
+                    "strategy": "trend_following",
+                    "markets": ["BTC/USD", "ETH/USD"]
+                },
+                "ml_model": {
+                    "type": "lstm",
+                    "features": ["price", "volume", "sentiment"]
+                }
+            },
+            {
+                "trading": {
+                    "initial_capital": 50000,
+                    "strategy": "mean_reversion",
+                    "markets": ["SOL/USD", "ADA/USD"]
+                },
+                "ml_model": {
+                    "type": "reinforcement",
+                    "features": ["technical_indicators", "order_flow"]
+                }
+            }
+        ]
+        
+        # Create and start bots
+        bot_ids = []
+        for config in configs:
+            bot_id = system.create_quantum_bot(config)
+            bot_ids.append(bot_id)
+            system.start_bot(bot_id)
+        
+        # Monitor system
+        while True:
+            status = system.get_system_status()
+            print(f"System Status: {json.dumps(status, indent=2)}")
+            time.sleep(300)  # Update every 5 minutes
+            
+    except KeyboardInterrupt:
+        print("Shutting down Quantum Edge System...")
+        if system:
+            system.stop()
+    except Exception as e:
+        print(f"Critical error: {str(e)}")
+        if system:
+            system.stop()
+        raise 
+        import logging
+import threading
+import queue
+import json
+import os
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from datetime import datetime
+import time
+from .trading_system import TradingSystem, create_trading_system
+from .code_guardian import CodeGuardian, create_guardian
+from .system_monitor import SystemMonitor
+from .dashboard import create_dashboard
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/ai_agent_manager.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class BotInstance:
+    """Represents a trading bot instance"""
+    bot_id: str
+    trading_system: TradingSystem
+    config: Dict
+    status: str
+    last_update: datetime
+    performance_metrics: Dict
+    message_queue: queue.Queue
+
+class AIAgentManager:
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        self.bots: Dict[str, BotInstance] = {}
+        self.code_guardian = create_guardian(project_root)
+        self.system_monitor = SystemMonitor(project_root)
+        self.message_queue = queue.Queue()
+        self.running = True
+
+        # Start management threads
+        self.threads = {
+            'monitor': threading.Thread(target=self._monitor_bots),
+            'message_handler': threading.Thread(target=self._handle_messages),
+            'code_repair': threading.Thread(target=self._continuous_code_repair)
+        }
+        
+        for thread in self.threads.values():
+            thread.daemon = True
+            thread.start()
+
+        # Initialize dashboard
+        self.dashboard = create_dashboard()
+        self.dashboard_thread = threading.Thread(target=self._run_dashboard)
+        self.dashboard_thread.daemon = True
+        self.dashboard_thread.start()
+
+    def create_bot(self, config: Dict) -> str:
+        """Create a new trading bot instance"""
+        try:
+            bot_id = f"bot_{len(self.bots) + 1}"
+            
+            # Save bot-specific config
+            config_path = os.path.join(self.project_root, 'config', f'{bot_id}_config.json')
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            # Create trading system
+            trading_system = create_trading_system(config_path)
+            
+            # Create bot instance
+            bot = BotInstance(
+                bot_id=bot_id,
+                trading_system=trading_system,
+                config=config,
+                status='initialized',
+                last_update=datetime.now(),
+                performance_metrics={},
+                message_queue=queue.Queue()
+            )
+            
+            self.bots[bot_id] = bot
+            logger.info(f"Created new bot instance: {bot_id}")
+            
+            return bot_id
+            
+        except Exception as e:
+            logger.error(f"Error creating bot: {str(e)}")
+            raise
+
+    def start_bot(self, bot_id: str):
+        """Start a trading bot"""
+        if bot_id in self.bots:
+            try:
+                bot = self.bots[bot_id]
+                bot.status = 'running'
+                bot.last_update = datetime.now()
+                logger.info(f"Started bot: {bot_id}")
+                
+                # Send start message to bot
+                self._send_message_to_bot(bot_id, {
+                    'type': 'command',
+                    'action': 'start',
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+            except Exception as e:
+                logger.error(f"Error starting bot {bot_id}: {str(e)}")
+                self.bots[bot_id].status = 'error'
+
+    def stop_bot(self, bot_id: str):
+        """Stop a trading bot"""
+        if bot_id in self.bots:
+            try:
+                bot = self.bots[bot_id]
+                bot.status = 'stopped'
+                bot.last_update = datetime.now()
+                bot.trading_system.stop()
+                logger.info(f"Stopped bot: {bot_id}")
+                
+            except Exception as e:
+                logger.error(f"Error stopping bot {bot_id}: {str(e)}")
+
+    def send_message_to_bot(self, bot_id: str, message: Dict):
+        """Send a message to a specific bot"""
+        if bot_id in self.bots:
+            self._send_message_to_bot(bot_id, message)
+            logger.info(f"Sent message to bot {bot_id}: {message}")
+
+    def broadcast_message(self, message: Dict):
+        """Send a message to all bots"""
+        for bot_id in self.bots:
+            self._send_message_to_bot(bot_id, message)
+        logger.info(f"Broadcast message to all bots: {message}")
+
+    def get_bot_status(self, bot_id: str) -> Optional[Dict]:
+        """Get status of a specific bot"""
+        if bot_id in self.bots:
+            bot = self.bots[bot_id]
+            return {
+                'bot_id': bot.bot_id,
+                'status': bot.status,
+                'last_update': bot.last_update.isoformat(),
+                'performance_metrics': bot.performance_metrics,
+                'trading_system_status': bot.trading_system.get_status()
+            }
+        return None
+
+    def get_system_status(self) -> Dict:
+        """Get overall system status"""
+        return {
+            'total_bots': len(self.bots),
+            'active_bots': len([b for b in self.bots.values() if b.status == 'running']),
+            'code_health': self.code_guardian.get_status_report(),
+            'system_health': self.system_monitor.get_system_status(),
+            'bots': {bot_id: self.get_bot_status(bot_id) for bot_id in self.bots}
+        }
+
+    def _send_message_to_bot(self, bot_id: str, message: Dict):
+        """Internal method to send message to bot"""
+        if bot_id in self.bots:
+            self.bots[bot_id].message_queue.put(message)
+
+    def _monitor_bots(self):
+        """Continuously monitor bot performance and health"""
+        while self.running:
+            try:
+                for bot_id, bot in self.bots.items():
+                    if bot.status == 'running':
+                        # Update bot metrics
+                        status = bot.trading_system.get_status()
+                        bot.performance_metrics = status['metrics']
+                        bot.last_update = datetime.now()
+
+                        # Check for issues
+                        if status['system_health']['alerts']['unacknowledged'] > 0:
+                            self._handle_bot_issue(bot_id, status)
+
+                time.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error in bot monitoring: {str(e)}")
+                time.sleep(300)
+
+    def _handle_messages(self):
+        """Handle incoming messages from bots"""
+        while self.running:
+            try:
+                for bot_id, bot in self.bots.items():
+                    while not bot.message_queue.empty():
+                        message = bot.message_queue.get_nowait()
+                        self._process_bot_message(bot_id, message)
+                        
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error handling messages: {str(e)}")
+                time.sleep(60)
+
+    def _continuous_code_repair(self):
+        """Continuously monitor and repair code issues"""
+        while self.running:
+            try:
+                # Get code issues
+                status = self.code_guardian.get_status_report()
+                
+                # Attempt to fix issues
+                for issue in self.code_guardian.issues:
+                    if not issue.fixed and issue.suggested_fix:
+                        if self.code_guardian.fix_issue(issue):
+                            logger.info(f"Fixed code issue: {issue.description}")
+                
+                time.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                logger.error(f"Error in code repair: {str(e)}")
+                time.sleep(600)
+
+    def _handle_bot_issue(self, bot_id: str, status: Dict):
+        """Handle issues with a specific bot"""
+        try:
+            # Create alert
+            alert = {
+                'type': 'alert',
+                'bot_id': bot_id,
+                'timestamp': datetime.now().isoformat(),
+                'status': status
+            }
+            
+            # Log alert
+            logger.warning(f"Bot issue detected: {alert}")
+            
+            # Add to message queue
+            self.message_queue.put(alert)
+            
+            # Take action based on issue severity
+            if status['system_health']['alerts']['by_level'].get('error', 0) > 0:
+                self.stop_bot(bot_id)
+                logger.error(f"Stopped bot {bot_id} due to critical issues")
+                
+        except Exception as e:
+            logger.error(f"Error handling bot issue: {str(e)}")
+
+    def _process_bot_message(self, bot_id: str, message: Dict):
+        """Process message from a bot"""
+        try:
+            if message['type'] == 'status_update':
+                self.bots[bot_id].status = message['status']
+                self.bots[bot_id].last_update = datetime.now()
+                
+            elif message['type'] == 'alert':
+                self._handle_bot_issue(bot_id, message)
+                
+            elif message['type'] == 'performance_update':
+                self.bots[bot_id].performance_metrics.update(message['metrics'])
+                
+        except Exception as e:
+            logger.error(f"Error processing bot message: {str(e)}")
+
+    def _run_dashboard(self):
+        """Run the dashboard"""
+        try:
+            self.dashboard.run_server(debug=True, port=8050)
+        except Exception as e:
+            logger.error(f"Error running dashboard: {str(e)}")
+
+    def stop(self):
+        """Stop the AI Agent Manager"""
+        self.running = False
+        
+        # Stop all bots
+        for bot_id in self.bots:
+            self.stop_bot(bot_id)
+        
+        # Stop components
+        self.code_guardian.stop()
+        self.system_monitor.stop()
+        
+        # Wait for threads
+        for thread in self.threads.values():
+            if thread.is_alive():
+                thread.join()
+
+def create_agent_manager(project_root: str) -> AIAgentManager:
+    """Create and initialize an AI Agent Manager"""
+    return AIAgentManager(project_root)
+
+if __name__ == "__main__":
+    # Example usage
+    manager = create_agent_manager(".")
+    
+    try:
+        # Create some test bots
+        config1 = {
+            "trading": {"initial_capital": 100000},
+            "strategy": {"name": "trend_following"},
+            "risk_management": {"max_positions": 5}
+        }
+        
+        config2 = {
+            "trading": {"initial_capital": 50000},
+            "strategy": {"name": "mean_reversion"},
+            "risk_management": {"max_positions": 3}
+        }
+        
+        # Create and start bots
+        bot1_id = manager.create_bot(config1)
+        bot2_id = manager.create_bot(config2)
+        
+        manager.start_bot(bot1_id)
+        manager.start_bot(bot2_id)
+        
+        # Monitor for a while
+        time.sleep(3600)  # Run for 1 hour
+        
+    finally:
+        manager.stop() 
+        import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import logging
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import json
+import os
+from .system_monitor import SystemMonitor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/trading_system.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Trade:
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    position_size: float
+    entry_time: datetime
+    exit_price: Optional[float] = None
+    exit_time: Optional[datetime] = None
+    pnl: Optional[float] = None
+    status: str = 'open'
+
+class TradingSystem:
+    def __init__(self, config_path: str):
+        # Load configuration
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
+        
+        # Initialize system monitor
+        self.monitor = SystemMonitor(os.path.dirname(os.path.dirname(__file__)))
+        
+        # Initialize trading parameters
+        self.initial_capital = self.config['trading']['initial_capital']
+        self.current_capital = self.initial_capital
+        self.performance_history = []
+        self.active_trades: List[Trade] = []
+        
+        # Initialize strategy parameters
+        self.strategy_params = self.config['strategy']
+        self.risk_params = self.config['risk_management']
+        
+        # Initialize performance metrics
+        self.metrics = {
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'max_drawdown': 0.0,
+            'sharpe_ratio': 0.0,
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0
+        }
+    
+    @SystemMonitor.monitor_component("strategy_execution")
+    def execute_strategy(self, market_data: pd.DataFrame) -> Optional[Dict]:
+        """Execute trading strategy"""
+        try:
+            # Generate trading signals
+            signal = self._generate_signals(market_data)
+            
+            if signal:
+                # Validate trade
+                if self._validate_trade(signal):
+                    # Execute trade
+                    trade = self._execute_trade(signal)
+                    return {'status': 'success', 'trade': trade}
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error executing strategy: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+    
+    @SystemMonitor.monitor_component("risk_management")
+    def _validate_trade(self, signal: Dict) -> bool:
+        """Validate trade against risk parameters"""
+        try:
+            # Check if we have too many open trades
+            if len(self.active_trades) >= self.risk_params['max_positions']:
+                return False
+            
+            # Check if we have enough capital
+            required_margin = self._calculate_margin(signal)
+            if required_margin > self.current_capital * self.risk_params['max_position_size']:
+                return False
+            
+            # Check if we're within daily loss limit
+            if self._check_daily_loss_limit():
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating trade: {str(e)}")
+            return False
+    
+    @SystemMonitor.monitor_component("trade_execution")
+    def _execute_trade(self, signal: Dict) -> Optional[Trade]:
+        """Execute a trade"""
+        try:
+            # Calculate position size
+            position_size = self._calculate_position_size(signal)
+            
+            # Create trade object
+            trade = Trade(
+                symbol=signal['symbol'],
+                direction=signal['direction'],
+                entry_price=signal['price'],
+                stop_loss=signal['stop_loss'],
+                take_profit=signal['take_profit'],
+                position_size=position_size,
+                entry_time=datetime.now(),
+                exit_price=None,
+                exit_time=None,
+                pnl=None,
+                status='open'
+            )
+            
+            # Add to active trades
+            self.active_trades.append(trade)
+            
+            return trade
+            
+        except Exception as e:
+            logger.error(f"Error executing trade: {str(e)}")
+            return None
+    
+    @SystemMonitor.monitor_component("performance_monitoring")
+    def update_performance(self):
+        """Update performance metrics"""
+        try:
+            if not self.performance_history:
+                return
+            
+            # Calculate basic metrics
+            total_trades = len(self.performance_history)
+            winning_trades = len([t for t in self.performance_history if t['pnl'] > 0])
+            
+            self.metrics.update({
+                'total_trades': total_trades,
+                'winning_trades': winning_trades,
+                'losing_trades': total_trades - winning_trades,
+                'win_rate': winning_trades / total_trades if total_trades > 0 else 0
+            })
+            
+            # Calculate advanced metrics
+            self._calculate_advanced_metrics()
+            
+            # Check if we need to adjust strategy
+            self._check_strategy_adjustment()
+            
+        except Exception as e:
+            logger.error(f"Error updating performance: {str(e)}")
+    
+    @SystemMonitor.monitor_component("strategy_adjustment")
+    def _check_strategy_adjustment(self):
+        """Check if strategy needs adjustment"""
+        try:
+            # Check win rate
+            if self.metrics['win_rate'] < self.strategy_params['min_win_rate']:
+                self._adjust_strategy('defensive')
+            elif self.metrics['win_rate'] > self.strategy_params['target_win_rate']:
+                self._adjust_strategy('aggressive')
+            
+            # Check drawdown
+            if self.metrics['max_drawdown'] > self.risk_params['max_drawdown']:
+                self._adjust_strategy('risk_reduction')
+            
+        except Exception as e:
+            logger.error(f"Error checking strategy adjustment: {str(e)}")
+    
+    def _adjust_strategy(self, mode: str):
+        """Adjust strategy parameters"""
+        if mode == 'defensive':
+            self.strategy_params['position_size'] *= 0.8
+            self.strategy_params['stop_loss_multiplier'] *= 0.9
+            
+        elif mode == 'aggressive':
+            self.strategy_params['position_size'] *= 1.2
+            self.strategy_params['take_profit_multiplier'] *= 1.1
+            
+        elif mode == 'risk_reduction':
+            self.strategy_params['position_size'] *= 0.7
+            self.strategy_params['max_positions'] = max(1, self.strategy_params['max_positions'] - 1)
+    
+    def get_status(self) -> Dict:
+        """Get current system status"""
+        return {
+            'capital': self.current_capital,
+            'active_trades': len(self.active_trades),
+            'metrics': self.metrics,
+            'system_health': self.monitor.get_system_status()
+        }
+    
+    def stop(self):
+        """Stop the trading system"""
+        self.monitor.stop()
+
+def create_trading_system(config_path: str) -> TradingSystem:
+    """Create and initialize a trading system"""
+    return TradingSystem(config_path)
+
+if __name__ == "__main__":
+    # Example usage
+    config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.json')
+    trading_system = create_trading_system(config_path)
+    
+    try:
+        # Simulate some trading
+        market_data = pd.DataFrame({
+            'timestamp': pd.date_range(start='2024-01-01', periods=100, freq='H'),
+            'open': np.random.randn(100).cumsum() + 100,
+            'high': np.random.randn(100).cumsum() + 102,
+            'low': np.random.randn(100).cumsum() + 98,
+            'close': np.random.randn(100).cumsum() + 100,
+            'volume': np.random.randint(1000, 10000, 100)
+        })
+        
+        for i in range(len(market_data)):
+            result = trading_system.execute_strategy(market_data.iloc[:i+1])
+            if result and result['status'] == 'success':
+                print(f"Executed trade: {result['trade']}")
+        
+        # Get final status
+        status = trading_system.get_status()
+        print("\nFinal Status:")
+        print(json.dumps(status, indent=2, default=str))
+        
+    finally:
+        trading_system.stop() 
+        import logging
+import time
+import threading
+from typing import Dict, Any, Optional
+from datetime import datetime
+import functools
+import traceback
+from .code_guardian import CodeGuardian, create_guardian
+
+logger = logging.getLogger(__name__)
+
+class SystemMonitor:
+    def __init__(self, project_root: str):
+        self.guardian = create_guardian(project_root)
+        self.component_status: Dict[str, Dict[str, Any]] = {}
+        self.performance_data: Dict[str, Dict[str, float]] = {}
+        self.alerts: Dict[str, Dict[str, Any]] = {}
+        self.running = True
+        
+        # Start monitoring thread
+        self.monitor_thread = threading.Thread(target=self._monitor_system)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+    
+    def monitor_component(self, component_name: str):
+        """Decorator to monitor component performance and errors"""
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                start_time = time.time()
+                try:
+                    result = func(*args, **kwargs)
+                    execution_time = time.time() - start_time
+                    
+                    # Update performance metrics
+                    self.guardian.monitor_performance(component_name, execution_time)
+                    
+                    # Update component status
+                    self.component_status[component_name] = {
+                        'status': 'healthy',
+                        'last_execution': datetime.now().isoformat(),
+                        'execution_time': execution_time,
+                        'error': None
+                    }
+                    
+                    return result
+                    
+                except Exception as e:
+                    error_info = {
+                        'type': type(e).__name__,
+                        'message': str(e),
+                        'traceback': traceback.format_exc()
+                    }
+                    
+                    # Update component status
+                    self.component_status[component_name] = {
+                        'status': 'error',
+                        'last_execution': datetime.now().isoformat(),
+                        'execution_time': time.time() - start_time,
+                        'error': error_info
+                    }
+                    
+                    # Create alert
+                    self._create_alert(
+                        component_name,
+                        f"Error in {component_name}: {str(e)}",
+                        'error',
+                        error_info
+                    )
+                    
+                    logger.error(f"Error in {component_name}: {str(e)}")
+                    raise
+            
+            return wrapper
+        return decorator
+    
+    def _create_alert(self, 
+                     component: str, 
+                     message: str, 
+                     level: str, 
+                     details: Optional[Dict] = None):
+        """Create a new alert"""
+        alert_id = f"{component}_{datetime.now().timestamp()}"
+        self.alerts[alert_id] = {
+            'component': component,
+            'message': message,
+            'level': level,
+            'timestamp': datetime.now().isoformat(),
+            'details': details,
+            'acknowledged': False
+        }
+    
+    def acknowledge_alert(self, alert_id: str):
+        """Acknowledge an alert"""
+        if alert_id in self.alerts:
+            self.alerts[alert_id]['acknowledged'] = True
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get overall system status"""
+        return {
+            'components': self.component_status,
+            'alerts': {
+                'total': len(self.alerts),
+                'unacknowledged': len([a for a in self.alerts.values() if not a['acknowledged']]),
+                'by_level': self._count_alerts_by_level()
+            },
+            'code_health': self.guardian.get_status_report(),
+            'performance': self._get_performance_summary()
+        }
+    
+    def _count_alerts_by_level(self) -> Dict[str, int]:
+        """Count alerts by level"""
+        counts = {'error': 0, 'warning': 0, 'info': 0}
+        for alert in self.alerts.values():
+            if alert['level'] in counts:
+                counts[alert['level']] += 1
+        return counts
+    
+    def _get_performance_summary(self) -> Dict[str, Dict[str, float]]:
+        """Get performance summary for all components"""
+        summary = {}
+        for component, metrics in self.guardian.performance_metrics.items():
+            if metrics:
+                summary[component] = {
+                    'avg_execution_time': sum(metrics) / len(metrics),
+                    'max_execution_time': max(metrics),
+                    'min_execution_time': min(metrics),
+                    'total_executions': len(metrics)
+                }
+        return summary
+    
+    def _monitor_system(self):
+        """Continuous system monitoring"""
+        while self.running:
+            try:
+                # Check component health
+                for component, status in self.component_status.items():
+                    if status['status'] == 'error':
+                        self._create_alert(
+                            component,
+                            f"Component {component} is in error state",
+                            'error',
+                            status['error']
+                        )
+                    
+                    # Check for performance degradation
+                    if component in self.guardian.performance_metrics:
+                        metrics = self.guardian.performance_metrics[component]
+                        if len(metrics) > 10:
+                            recent_avg = sum(metrics[-10:]) / 10
+                            overall_avg = sum(metrics) / len(metrics)
+                            
+                            if recent_avg > overall_avg * 1.5:  # 50% slower
+                                self._create_alert(
+                                    component,
+                                    f"Performance degradation detected in {component}",
+                                    'warning',
+                                    {
+                                        'recent_avg': recent_avg,
+                                        'overall_avg': overall_avg
+                                    }
+                                )
+                
+                # Sleep for a while
+                time.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error in system monitoring: {str(e)}")
+                time.sleep(300)  # Wait longer if there's an error
+    
+    def stop(self):
+        """Stop the system monitor"""
+        self.running = False
+        self.guardian.stop()
+        if self.monitor_thread.is_alive():
+            self.monitor_thread.join()
+
+# Example usage
+def example_usage():
+    # Create system monitor
+    monitor = SystemMonitor(".")
+    
+    # Example component with monitoring
+    @monitor.monitor_component("example_component")
+    def example_function(x: int) -> int:
+        time.sleep(1)  # Simulate work
+        return x * 2
+    
+    try:
+        # Run component
+        for i in range(5):
+            result = example_function(i)
+            print(f"Result: {result}")
+        
+        # Get system status
+        status = monitor.get_system_status()
+        print("\nSystem Status:")
+        print(json.dumps(status, indent=2))
+        
+    finally:
+        monitor.stop()
+
+if __name__ == "__main__":
+    example_usage() 
+    import inspect
+import logging
+import sys
+import traceback
+import ast
+import typing
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Tuple
+import numpy as np
+from datetime import datetime
+import importlib
+import threading
+import time
+import json
+import os
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class CodeIssue:
+    """Represents a code issue found by the guardian"""
+    file_path: str
+    line_number: int
+    issue_type: str
+    description: str
+    severity: str
+    suggested_fix: Optional[str] = None
+    fixed: bool = False
+
+class CodeGuardian:
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+        self.issues: List[CodeIssue] = []
+        self.module_states: Dict[str, float] = {}  # Module path -> last modified timestamp
+        self.performance_metrics: Dict[str, List[float]] = {}
+        self.error_patterns: Dict[str, str] = self._load_error_patterns()
+        
+        # Start monitoring thread
+        self.running = True
+        self.monitor_thread = threading.Thread(target=self._continuous_monitoring)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+    
+    def _load_error_patterns(self) -> Dict[str, str]:
+        """Load known error patterns and their fixes"""
+        return {
+            "IndexError": "Check array bounds and data availability",
+            "KeyError": "Verify dictionary keys exist before access",
+            "AttributeError": "Ensure object attributes exist",
+            "TypeError": "Check type compatibility",
+            "ValueError": "Validate input values",
+            "ZeroDivisionError": "Add zero-value checking",
+            "ImportError": "Verify module installation and import path",
+            "MemoryError": "Optimize memory usage or add cleanup",
+            "RuntimeError": "Check execution flow and state",
+        }
+    
+    def analyze_code(self, file_path: str) -> List[CodeIssue]:
+        """Analyze code for potential issues"""
+        try:
+            with open(file_path, 'r') as f:
+                code = f.read()
+            
+            issues = []
+            tree = ast.parse(code)
+            
+            # Check for common issues
+            issues.extend(self._check_error_handling(tree, file_path))
+            issues.extend(self._check_resource_management(tree, file_path))
+            issues.extend(self._check_performance_patterns(tree, file_path))
+            issues.extend(self._check_code_style(tree, file_path))
+            
+            return issues
+            
+        except Exception as e:
+            logger.error(f"Error analyzing {file_path}: {str(e)}")
+            return []
+    
+    def _check_error_handling(self, tree: ast.AST, file_path: str) -> List[CodeIssue]:
+        """Check for proper error handling"""
+        issues = []
+        for node in ast.walk(tree):
+            # Check for bare except clauses
+            if isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    if handler.type is None:
+                        issues.append(CodeIssue(
+                            file_path=file_path,
+                            line_number=handler.lineno,
+                            issue_type="error_handling",
+                            description="Bare except clause found",
+                            severity="warning",
+                            suggested_fix="Specify exception type(s) to catch"
+                        ))
+        return issues
+    
+    def _check_resource_management(self, tree: ast.AST, file_path: str) -> List[CodeIssue]:
+        """Check for proper resource management"""
+        issues = []
+        for node in ast.walk(tree):
+            # Check for file operations without context manager
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in ['open']:
+                    if not isinstance(node.parent, ast.withitem):
+                        issues.append(CodeIssue(
+                            file_path=file_path,
+                            line_number=node.lineno,
+                            issue_type="resource_management",
+                            description="File opened without context manager",
+                            severity="warning",
+                            suggested_fix="Use 'with' statement for file operations"
+                        ))
+        return issues
+    
+    def _check_performance_patterns(self, tree: ast.AST, file_path: str) -> List[CodeIssue]:
+        """Check for performance-related issues"""
+        issues = []
+        for node in ast.walk(tree):
+            # Check for inefficient list operations
+            if isinstance(node, ast.For):
+                if isinstance(node.target, ast.Name) and isinstance(node.iter, ast.Call):
+                    if isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'range':
+                        if len(node.iter.args) == 1 and isinstance(node.iter.args[0], ast.Call):
+                            if isinstance(node.iter.args[0].func, ast.Name) and node.iter.args[0].func.id == 'len':
+                                issues.append(CodeIssue(
+                                    file_path=file_path,
+                                    line_number=node.lineno,
+                                    issue_type="performance",
+                                    description="Inefficient list iteration",
+                                    severity="info",
+                                    suggested_fix="Use 'for item in items' instead of range(len(items))"
+                                ))
+        return issues
+    
+    def _check_code_style(self, tree: ast.AST, file_path: str) -> List[CodeIssue]:
+        """Check for code style issues"""
+        issues = []
+        for node in ast.walk(tree):
+            # Check for overly complex functions
+            if isinstance(node, ast.FunctionDef):
+                if len(node.body) > 50:  # Arbitrary threshold
+                    issues.append(CodeIssue(
+                        file_path=file_path,
+                        line_number=node.lineno,
+                        issue_type="code_style",
+                        description="Function is too long",
+                        severity="info",
+                        suggested_fix="Consider breaking down into smaller functions"
+                    ))
+        return issues
+    
+    def monitor_performance(self, module_name: str, execution_time: float):
+        """Monitor module performance"""
+        if module_name not in self.performance_metrics:
+            self.performance_metrics[module_name] = []
+        
+        self.performance_metrics[module_name].append(execution_time)
+        
+        # Check for performance degradation
+        if len(self.performance_metrics[module_name]) > 10:
+            recent_avg = np.mean(self.performance_metrics[module_name][-10:])
+            overall_avg = np.mean(self.performance_metrics[module_name])
+            
+            if recent_avg > overall_avg * 1.5:  # 50% slower than average
+                self.issues.append(CodeIssue(
+                    file_path=module_name,
+                    line_number=0,
+                    issue_type="performance_degradation",
+                    description=f"Performance degradation detected in {module_name}",
+                    severity="warning"
+                ))
+    
+    def fix_issue(self, issue: CodeIssue) -> bool:
+        """Attempt to fix a code issue"""
+        try:
+            if not issue.suggested_fix:
+                return False
+            
+            with open(issue.file_path, 'r') as f:
+                lines = f.readlines()
+            
+            if issue.issue_type == "error_handling":
+                # Fix bare except
+                if "Bare except clause found" in issue.description:
+                    lines[issue.line_number - 1] = lines[issue.line_number - 1].replace(
+                        "except:", "except Exception:"
+                    )
+            
+            elif issue.issue_type == "resource_management":
+                # Fix file operations
+                if "File opened without context manager" in issue.description:
+                    indent = len(lines[issue.line_number - 1]) - len(lines[issue.line_number - 1].lstrip())
+                    lines[issue.line_number - 1] = " " * indent + "with " + lines[issue.line_number - 1].lstrip()
+            
+            with open(issue.file_path, 'w') as f:
+                f.writelines(lines)
+            
+            issue.fixed = True
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error fixing issue: {str(e)}")
+            return False
+    
+    def _continuous_monitoring(self):
+        """Continuously monitor code for issues"""
+        while self.running:
+            try:
+                # Check all Python files in project
+                for root, _, files in os.walk(self.project_root):
+                    for file in files:
+                        if file.endswith('.py'):
+                            file_path = os.path.join(root, file)
+                            
+                            # Check if file was modified
+                            current_mtime = os.path.getmtime(file_path)
+                            if file_path not in self.module_states or current_mtime > self.module_states[file_path]:
+                                self.module_states[file_path] = current_mtime
+                                
+                                # Analyze code
+                                new_issues = self.analyze_code(file_path)
+                                self.issues.extend(new_issues)
+                                
+                                # Try to fix issues
+                                for issue in new_issues:
+                                    if issue.suggested_fix:
+                                        self.fix_issue(issue)
+                
+                # Sleep for a while
+                time.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error in continuous monitoring: {str(e)}")
+                time.sleep(300)  # Wait longer if there's an error
+    
+    def get_status_report(self) -> Dict[str, Any]:
+        """Generate a status report"""
+        return {
+            'total_issues': len(self.issues),
+            'fixed_issues': len([i for i in self.issues if i.fixed]),
+            'active_issues': len([i for i in self.issues if not i.fixed]),
+            'issues_by_type': self._count_issues_by_type(),
+            'performance_metrics': self._summarize_performance_metrics()
+        }
+    
+    def _count_issues_by_type(self) -> Dict[str, int]:
+        """Count issues by type"""
+        counts = {}
+        for issue in self.issues:
+            if issue.issue_type not in counts:
+                counts[issue.issue_type] = 0
+            counts[issue.issue_type] += 1
+        return counts
+    
+    def _summarize_performance_metrics(self) -> Dict[str, Dict[str, float]]:
+        """Summarize performance metrics"""
+        summary = {}
+        for module, metrics in self.performance_metrics.items():
+            if metrics:
+                summary[module] = {
+                    'avg': np.mean(metrics),
+                    'min': np.min(metrics),
+                    'max': np.max(metrics),
+                    'std': np.std(metrics)
+                }
+        return summary
+    
+    def stop(self):
+        """Stop the guardian"""
+        self.running = False
+        if self.monitor_thread.is_alive():
+            self.monitor_thread.join()
+
+def create_guardian(project_root: str) -> CodeGuardian:
+    """Create and start a code guardian instance"""
+    return CodeGuardian(project_root)
+
+if __name__ == "__main__":
+    # Example usage
+    guardian = create_guardian(".")
+    try:
+        while True:
+            status = guardian.get_status_report()
+            print(json.dumps(status, indent=2))
+            time.sleep(300)  # Print status every 5 minutes
+    except KeyboardInterrupt:
+        guardian.stop() import os
+import sys
+import logging
+from datetime import datetime, timedelta
+from src.backtesting import Backtester
+from src.dashboard import run_dashboard
+import threading
+import webbrowser
+import time
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('analysis.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+def run_backtests():
+    """Run all backtest scenarios"""
+    # Create results directory if it doesn't exist
+    results_dir = 'backtest_results'
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Load configuration
+    config_path = os.path.join(os.path.dirname(__file__), 'config', 'config.json')
+    
+    # Create backtester
+    backtester = Backtester(config_path)
+    
+    # Define test scenarios
+    scenarios = [
+        {
+            'name': 'BTC/USDT 1h - Last 30 days',
+            'symbol': 'BTC/USDT',
+            'timeframe': '1h',
+            'days': 30
+        },
+        {
+            'name': 'ETH/USDT 4h - Last 60 days',
+            'symbol': 'ETH/USDT',
+            'timeframe': '4h',
+            'days': 60
+        },
+        {
+            'name': 'BTC/USDT 1d - Last 90 days',
+            'symbol': 'BTC/USDT',
+            'timeframe': '1d',
+            'days': 90
+        },
+        {
+            'name': 'ETH/USDT 1d - Last 90 days',
+            'symbol': 'ETH/USDT',
+            'timeframe': '1d',
+            'days': 90
+        }
+    ]
+    
+    # Run each scenario
+    for scenario in scenarios:
+        logger.info(f"\nRunning scenario: {scenario['name']}")
+        
+        # Calculate date range
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=scenario['days'])
+        
+        # Run backtest
+        results = backtester.run_backtest(
+            symbol=scenario['symbol'],
+            timeframe=scenario['timeframe'],
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=50.0
+        )
+        
+        if results:
+            # Save results
+            filename = f"backtest_results_{scenario['symbol'].replace('/', '_')}_{scenario['timeframe']}.json"
+            filepath = os.path.join(results_dir, filename)
+            backtester.save_results(filepath)
+            logger.info(f"Results saved to {filepath}")
+        else:
+            logger.error(f"Backtest failed for scenario: {scenario['name']}")
+
+def open_browser():
+    """Open browser after a short delay"""
+    time.sleep(3)  # Wait for the server to start
+    webbrowser.open('http://localhost:8050')
+
+def main():
+    """Run backtests and launch dashboard"""
+    try:
+        # Run backtests
+        logger.info("Starting backtests...")
+        run_backtests()
+        logger.info("Backtests completed successfully")
+        
+        # Launch dashboard
+        logger.info("Launching dashboard...")
+        threading.Thread(target=open_browser).start()
+        run_dashboard()
+        
+    except Exception as e:
+        logger.error(f"Error during analysis: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main() 
+    import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output, State
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+import json
+import os
+from datetime import datetime
+import numpy as np
+from .code_guardian import create_guardian, CodeGuardian
+
+def load_backtest_results(results_dir):
+    """Load all backtest results from directory"""
+    results = {}
+    for file in os.listdir(results_dir):
+        if file.startswith('backtest_results_') and file.endswith('.json'):
+            with open(os.path.join(results_dir, file), 'r') as f:
+                scenario_name = file.replace('backtest_results_', '').replace('.json', '')
+                results[scenario_name] = json.load(f)
+    return results
+
+def create_dashboard(results_dir='backtest_results'):
+    """Create and run the dashboard"""
+    app = dash.Dash(__name__)
+    
+    # Load results
+    results = load_backtest_results(results_dir)
+    
+    # Initialize Code Guardian
+    guardian = create_guardian(os.path.dirname(os.path.dirname(__file__)))
+    
+    # Dashboard layout
+    app.layout = html.Div([
+        # Header
+        html.Div([
+            html.H1('AI Trading Bot - Backtest Results & System Health Dashboard',
+                   style={'textAlign': 'center', 'color': '#2c3e50', 'marginBottom': 30}),
+        ], style={'backgroundColor': '#ecf0f1', 'padding': '20px'}),
+        
+        # Tabs for different sections
+        dcc.Tabs([
+            # Backtest Results Tab
+            dcc.Tab(label='Backtest Results', children=[
+                # Scenario Selection
+                html.Div([
+                    html.Label('Select Scenario:'),
+                    dcc.Dropdown(
+                        id='scenario-dropdown',
+                        options=[{'label': k, 'value': k} for k in results.keys()],
+                        value=list(results.keys())[0] if results else None,
+                        style={'width': '100%'}
+                    ),
+                ], style={'margin': '20px'}),
+                
+                # Main Charts
+                html.Div([
+                    # Trading Chart
+                    html.Div([
+                        dcc.Graph(id='trading-chart')
+                    ], style={'width': '100%', 'marginBottom': '20px'}),
+                    
+                    # Performance Metrics Cards
+                    html.Div([
+                        html.Div([
+                            html.Div(id='metrics-cards'),
+                        ], style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'space-around'})
+                    ], style={'marginBottom': '20px'}),
+                    
+                    # Trade Distribution Chart
+                    html.Div([
+                        dcc.Graph(id='trade-distribution')
+                    ], style={'width': '100%', 'marginBottom': '20px'}),
+                    
+                    # Drawdown Chart
+                    html.Div([
+                        dcc.Graph(id='drawdown-chart')
+                    ], style={'width': '100%'})
+                ], style={'padding': '20px'})
+            ]),
+            
+            # System Health Tab
+            dcc.Tab(label='System Health', children=[
+                html.Div([
+                    # Code Health Overview
+                    html.Div([
+                        html.H2('Code Health Overview', style={'textAlign': 'center'}),
+                        html.Div(id='code-health-cards', style={
+                            'display': 'flex',
+                            'flexWrap': 'wrap',
+                            'justifyContent': 'space-around',
+                            'margin': '20px'
+                        })
+                    ]),
+                    
+                    # Code Issues Table
+                    html.Div([
+                        html.H3('Active Code Issues'),
+                        html.Div(id='code-issues-table')
+                    ], style={'margin': '20px'}),
+                    
+                    # Performance Metrics
+                    html.Div([
+                        html.H3('Module Performance'),
+                        dcc.Graph(id='performance-chart')
+                    ], style={'margin': '20px'}),
+                    
+                    # Auto-Fix Controls
+                    html.Div([
+                        html.H3('Issue Resolution'),
+                        html.Button('Auto-Fix Selected Issues', id='auto-fix-button'),
+                        html.Div(id='auto-fix-status')
+                    ], style={'margin': '20px'})
+                ])
+            ]),
+            
+            # System Logs Tab
+            dcc.Tab(label='System Logs', children=[
+                html.Div([
+                    html.H2('System Logs'),
+                    dcc.Interval(id='log-update', interval=5000),  # Update every 5 seconds
+                    html.Pre(id='log-content', style={
+                        'backgroundColor': '#2c3e50',
+                        'color': '#ecf0f1',
+                        'padding': '20px',
+                        'borderRadius': '5px',
+                        'height': '500px',
+                        'overflow': 'auto'
+                    })
+                ], style={'margin': '20px'})
+            ])
+        ])
+    ])
+    
+    @app.callback(
+        [Output('trading-chart', 'figure'),
+         Output('metrics-cards', 'children'),
+         Output('trade-distribution', 'figure'),
+         Output('drawdown-chart', 'figure')],
+        [Input('scenario-dropdown', 'value')]
+    )
+    def update_charts(selected_scenario):
+        if not selected_scenario or selected_scenario not in results:
+            return {}, [], {}, {}
+        
+        result = results[selected_scenario]
+        trades_df = pd.DataFrame(result['trades'])
+        equity_df = pd.DataFrame(result['equity_curve'])
+        metrics = result['performance_metrics']
+        
+        # 1. Trading Chart
+        trading_fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            subplot_titles=('Price and Trades', 'Equity Curve'),
+            row_heights=[0.7, 0.3]
+        )
+        
+        # Add price line
+        trading_fig.add_trace(
+            go.Scatter(
+                x=trades_df['timestamp'],
+                y=trades_df['price'],
+                name='Price',
+                line=dict(color='#2980b9')
+            ),
+            row=1, col=1
+        )
+        
+        # Add buy/sell markers
+        for action, color in [('buy', '#27ae60'), ('sell', '#c0392b')]:
+            mask = trades_df['action'] == action
+            trading_fig.add_trace(
+                go.Scatter(
+                    x=trades_df[mask]['timestamp'],
+                    y=trades_df[mask]['price'],
+                    mode='markers',
+                    name=action.capitalize(),
+                    marker=dict(color=color, size=10)
+                ),
+                row=1, col=1
+            )
+        
+        # Add equity curve
+        trading_fig.add_trace(
+            go.Scatter(
+                x=equity_df['timestamp'],
+                y=equity_df['equity'],
+                name='Equity',
+                line=dict(color='#8e44ad')
+            ),
+            row=2, col=1
+        )
+        
+        trading_fig.update_layout(
+            title='Trading Activity and Equity Curve',
+            height=800,
+            template='plotly_white'
+        )
+        
+        # 2. Metrics Cards
+        cards = []
+        metrics_style = {
+            'width': '200px',
+            'margin': '10px',
+            'padding': '15px',
+            'borderRadius': '5px',
+            'boxShadow': '2px 2px 5px rgba(0,0,0,0.1)',
+            'textAlign': 'center'
+        }
+        
+        metrics_data = [
+            ('Total Return', f"{metrics['total_return']:.2%}", '#27ae60'),
+            ('Win Rate', f"{metrics['win_rate']:.2%}", '#2980b9'),
+            ('Sharpe Ratio', f"{metrics['sharpe_ratio']:.2f}", '#8e44ad'),
+            ('Max Drawdown', f"{metrics['max_drawdown']:.2%}", '#c0392b'),
+            ('Total Trades', str(metrics['total_trades']), '#2c3e50')
+        ]
+        
+        for label, value, color in metrics_data:
+            cards.append(html.Div([
+                html.H4(label, style={'color': '#7f8c8d'}),
+                html.H3(value, style={'color': color})
+            ], style=metrics_style))
+        
+        # 3. Trade Distribution
+        returns = pd.Series([float(x) for x in trades_df['price'].pct_change().dropna()])
+        dist_fig = go.Figure()
+        dist_fig.add_trace(go.Histogram(
+            x=returns,
+            nbinsx=30,
+            name='Returns Distribution',
+            marker_color='#3498db'
+        ))
+        
+        dist_fig.update_layout(
+            title='Trade Returns Distribution',
+            xaxis_title='Return',
+            yaxis_title='Frequency',
+            template='plotly_white'
+        )
+        
+        # 4. Drawdown Chart
+        equity_series = pd.Series([float(x) for x in equity_df['equity']])
+        rolling_max = equity_series.expanding().max()
+        drawdowns = (equity_series - rolling_max) / rolling_max
+        
+        dd_fig = go.Figure()
+        dd_fig.add_trace(go.Scatter(
+            x=equity_df['timestamp'],
+            y=drawdowns,
+            fill='tozeroy',
+            name='Drawdown',
+            line=dict(color='#e74c3c')
+        ))
+        
+        dd_fig.update_layout(
+            title='Drawdown Over Time',
+            xaxis_title='Date',
+            yaxis_title='Drawdown',
+            template='plotly_white'
+        )
+        
+        return trading_fig, cards, dist_fig, dd_fig
+    
+    @app.callback(
+        [Output('code-health-cards', 'children'),
+         Output('code-issues-table', 'children'),
+         Output('performance-chart', 'figure'),
+         Output('auto-fix-status', 'children')],
+        [Input('auto-fix-button', 'n_clicks')],
+        [State('code-issues-table', 'selected_rows')]
+    )
+    def update_system_health(n_clicks, selected_rows):
+        # Get guardian status
+        status = guardian.get_status_report()
+        
+        # Create health cards
+        health_cards = []
+        health_metrics = [
+            ('Total Issues', status['total_issues'], '#e74c3c'),
+            ('Fixed Issues', status['fixed_issues'], '#27ae60'),
+            ('Active Issues', status['active_issues'], '#f39c12'),
+            ('Code Coverage', '85%', '#3498db')  # Example metric
+        ]
+        
+        for label, value, color in health_metrics:
+            health_cards.append(html.Div([
+                html.H4(label),
+                html.H3(str(value))
+            ], style={
+                'width': '200px',
+                'margin': '10px',
+                'padding': '15px',
+                'borderRadius': '5px',
+                'boxShadow': '2px 2px 5px rgba(0,0,0,0.1)',
+                'textAlign': 'center',
+                'backgroundColor': color,
+                'color': 'white'
+            }))
+        
+        # Create issues table
+        issues_table = html.Table([
+            html.Thead(html.Tr([
+                html.Th('File'),
+                html.Th('Line'),
+                html.Th('Type'),
+                html.Th('Severity'),
+                html.Th('Description'),
+                html.Th('Status')
+            ])),
+            html.Tbody([
+                html.Tr([
+                    html.Td(issue.file_path),
+                    html.Td(issue.line_number),
+                    html.Td(issue.issue_type),
+                    html.Td(issue.severity),
+                    html.Td(issue.description),
+                    html.Td('Fixed' if issue.fixed else 'Active')
+                ]) for issue in guardian.issues
+            ])
+        ], style={'width': '100%'})
+        
+        # Create performance chart
+        perf_data = status['performance_metrics']
+        perf_fig = go.Figure()
+        
+        for module, metrics in perf_data.items():
+            perf_fig.add_trace(go.Scatter(
+                x=list(range(len(guardian.performance_metrics[module]))),
+                y=guardian.performance_metrics[module],
+                name=module,
+                mode='lines+markers'
+            ))
+        
+        perf_fig.update_layout(
+            title='Module Performance Over Time',
+            xaxis_title='Execution Count',
+            yaxis_title='Execution Time (s)',
+            template='plotly_white'
+        )
+        
+        # Handle auto-fix status
+        fix_status = None
+        if n_clicks and selected_rows:
+            fixed_count = sum(1 for i in selected_rows if guardian.fix_issue(guardian.issues[i]))
+            fix_status = f"Fixed {fixed_count} out of {len(selected_rows)} selected issues"
+        
+        return health_cards, issues_table, perf_fig, fix_status
+    
+    @app.callback(
+        Output('log-content', 'children'),
+        [Input('log-update', 'n_intervals')]
+    )
+    def update_logs(_):
+        try:
+            with open('analysis.log', 'r') as f:
+                logs = f.readlines()
+                return ''.join(logs[-100:])  # Show last 100 lines
+        except Exception as e:
+            return f"Error reading logs: {str(e)}"
+    
+    return app
+
+def run_dashboard(port=8050):
+    """Run the dashboard"""
+    app = create_dashboard()
+    app.run_server(debug=True, port=port)
+
+if __name__ == '__main__':
+    run_dashboard() 
+    {
+    "exchange": {
+        "name": "binance",
+        "api_key": "YOUR_API_KEY",
+        "api_secret": "YOUR_API_SECRET",
+        "testnet": true
+    },
+    "trading": {
+        "symbols": ["BTC/USDT", "ETH/USDT"],
+        "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"],
+        "lookback_periods": 100,
+        "state_file": "trading_state.json",
+        "initial_capital": 50.0,
+        "max_positions": 3,
+        "leverage": 1
+    },
+    "risk_management": {
+        "risk_per_trade": 0.02,
+        "max_daily_loss": 0.05,
+        "max_drawdown": 0.15,
+        "stop_loss_pct": 0.02,
+        "take_profit_pct": 0.04,
+        "min_win_rate": 0.45,
+        "min_profit_factor": 1.2
+    },
+    "technical_analysis": {
+        "indicators": {
+            "sma": [20, 50, 200],
+            "ema": [20],
+            "rsi": [14],
+            "macd": {
+                "fast": 12,
+                "slow": 26,
+                "signal": 9
+            },
+            "bollinger_bands": {
+                "period": 20,
+                "std_dev": 2
+            }
+        },
+        "patterns": {
+            "candlestick": true,
+            "chart": true
+        }
+    },
+    "machine_learning": {
+        "model_type": "lstm",
+        "features": [
+            "open", "high", "low", "close", "volume",
+            "sma_20", "sma_50", "sma_200",
+            "rsi_14", "macd", "macd_signal", "macd_hist",
+            "bb_upper", "bb_middle", "bb_lower"
+        ],
+        "train_test_split": 0.2,
+        "validation_split": 0.1,
+        "rl": {
+            "learning_rate": 0.0003,
+            "n_steps": 2048,
+            "batch_size": 64,
+            "n_epochs": 10,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_range": 0.2,
+            "ent_coef": 0.01,
+            "vf_coef": 0.5
+        }
+    },
+    "sentiment_analysis": {
+        "news_api_key": "YOUR_NEWS_API_KEY",
+        "twitter_api_key": "YOUR_TWITTER_API_KEY",
+        "twitter_api_secret": "YOUR_TWITTER_API_SECRET",
+        "twitter_access_token": "YOUR_TWITTER_ACCESS_TOKEN",
+        "twitter_access_token_secret": "YOUR_TWITTER_ACCESS_TOKEN_SECRET",
+        "sentiment_weights": {
+            "news": 0.4,
+            "twitter": 0.3,
+            "market": 0.3
+        },
+        "sentiment_thresholds": {
+            "positive": 0.3,
+            "negative": -0.3
+        }
+    },
+    "signal_weights": {
+        "technical": 0.4,
+        "ml": 0.3,
+        "sentiment": 0.2,
+        "risk": 0.1
+    },
+    "signal_thresholds": {
+        "buy": 0.6,
+        "sell": -0.6
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "trading_bot.log",
+        "max_size": 10485760,
+        "backup_count": 5
+    },
+    "web_dashboard": {
+        "host": "localhost",
+        "port": 5000,
+        "debug": false
+    }
+} 
+import os
+import sys
+import logging
+import json
+import time
+from datetime import datetime
+from typing import Dict, List
+import pandas as pd
+import ccxt
+from concurrent.futures import ThreadPoolExecutor
+import schedule
+import threading
+import signal
+import queue
+
+from .trading_strategy import TradingStrategy
+from .config import load_config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+class TradingBot:
+    def __init__(self, config_path: str):
+        # Load configuration
+        self.config = load_config(config_path)
+        
+        # Initialize exchange
+        self.exchange = self._initialize_exchange()
+        
+        # Initialize trading strategy
+        self.strategy = TradingStrategy(self.config)
+        
+        # Initialize state
+        self.is_running = False
+        self.symbols = self.config['trading']['symbols']
+        self.timeframes = self.config['trading']['timeframes']
+        self.data_queue = queue.Queue()
+        self.signal_queue = queue.Queue()
+        
+        # Load previous state if exists
+        self._load_state()
+    
+    def _initialize_exchange(self) -> ccxt.Exchange:
+        """
+        Initialize the cryptocurrency exchange
+        """
+        try:
+            exchange_class = getattr(ccxt, self.config['exchange']['name'])
+            exchange = exchange_class({
+                'apiKey': self.config['exchange']['api_key'],
+                'secret': self.config['exchange']['api_secret'],
+                'enableRateLimit': True
+            })
+            
+            # Test connection
+            exchange.load_markets()
+            logger.info(f"Successfully connected to {self.config['exchange']['name']}")
+            
+            return exchange
+            
+        except Exception as e:
+            logger.error(f"Error initializing exchange: {str(e)}")
+            raise
+    
+    def _load_state(self):
+        """
+        Load previous trading state
+        """
+        state_file = self.config['trading']['state_file']
+        if os.path.exists(state_file):
+            try:
+                self.strategy.load_state(state_file)
+                logger.info("Successfully loaded previous trading state")
+            except Exception as e:
+                logger.error(f"Error loading state: {str(e)}")
+    
+    def _save_state(self):
+        """
+        Save current trading state
+        """
+        try:
+            self.strategy.save_state(self.config['trading']['state_file'])
+            logger.info("Successfully saved trading state")
+        except Exception as e:
+            logger.error(f"Error saving state: {str(e)}")
+    
+    def fetch_market_data(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """
+        Fetch market data from exchange
+        """
+        try:
+            # Get OHLCV data
+            ohlcv = self.exchange.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                limit=self.config['trading']['lookback_periods']
+            )
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                ohlcv,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error fetching market data for {symbol}: {str(e)}")
+            return None
+    
+    def process_market_data(self):
+        """
+        Process market data from queue
+        """
+        while self.is_running:
+            try:
+                # Get data from queue
+                data = self.data_queue.get(timeout=1)
+                symbol, timeframe, df = data
+                
+                # Generate trading signals
+                signal = self.strategy.analyze_market(symbol, df)
+                
+                if signal:
+                    # Add signal to queue
+                    self.signal_queue.put(signal)
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error processing market data: {str(e)}")
+    
+    def execute_signals(self):
+        """
+        Execute trading signals from queue
+        """
+        while self.is_running:
+            try:
+                # Get signal from queue
+                signal = self.signal_queue.get(timeout=1)
+                
+                # Execute trade
+                if self.strategy.execute_trade(signal):
+                    logger.info(f"Executed {signal.action} trade for {signal.symbol}")
+                    
+                    # Update positions with current prices
+                    current_prices = {
+                        symbol: self.exchange.fetch_ticker(symbol)['last']
+                        for symbol in self.symbols
+                    }
+                    self.strategy.update_positions(current_prices)
+                    
+                    # Save state after trade
+                    self._save_state()
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error executing signals: {str(e)}")
+    
+    def update_market_data(self):
+        """
+        Update market data for all symbols
+        """
+        with ThreadPoolExecutor(max_workers=len(self.symbols)) as executor:
+            futures = []
+            
+            for symbol in self.symbols:
+                for timeframe in self.timeframes:
+                    future = executor.submit(self.fetch_market_data, symbol, timeframe)
+                    futures.append((symbol, timeframe, future))
+            
+            for symbol, timeframe, future in futures:
+                try:
+                    df = future.result()
+                    if df is not None:
+                        self.data_queue.put((symbol, timeframe, df))
+                except Exception as e:
+                    logger.error(f"Error updating market data for {symbol}: {str(e)}")
+    
+    def schedule_tasks(self):
+        """
+        Schedule periodic tasks
+        """
+        # Schedule market data updates
+        for timeframe in self.timeframes:
+            schedule.every().minute.at(":00").do(self.update_market_data)
+        
+        # Schedule state saving
+        schedule.every().hour.at(":00").do(self._save_state)
+        
+        # Run the scheduler
+        while self.is_running:
+            schedule.run_pending()
+            time.sleep(1)
+    
+    def start(self):
+        """
+        Start the trading bot
+        """
+        try:
+            self.is_running = True
+            
+            # Start threads
+            threads = [
+                threading.Thread(target=self.process_market_data),
+                threading.Thread(target=self.execute_signals),
+                threading.Thread(target=self.schedule_tasks)
+            ]
+            
+            for thread in threads:
+                thread.daemon = True
+                thread.start()
+            
+            # Initial market data update
+            self.update_market_data()
+            
+            logger.info("Trading bot started successfully")
+            
+            # Wait for shutdown signal
+            while self.is_running:
+                time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Error starting trading bot: {str(e)}")
+            self.stop()
+    
+    def stop(self):
+        """
+        Stop the trading bot
+        """
+        try:
+            self.is_running = False
+            self._save_state()
+            logger.info("Trading bot stopped successfully")
+        except Exception as e:
+            logger.error(f"Error stopping trading bot: {str(e)}")
+
+def main():
+    # Load configuration
+    config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.json')
+    
+    # Create trading bot
+    bot = TradingBot(config_path)
+    
+    # Handle shutdown signals
+    def signal_handler(signum, frame):
+        logger.info("Received shutdown signal")
+        bot.stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start trading bot
+    bot.start()
+
+if __name__ == "__main__":
+    main() 
+    import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+import logging
+from datetime import datetime
+from dataclasses import dataclass
+import json
+import os
+
+from .technical_analysis import TechnicalAnalyzer
+from .machine_learning import MachineLearningModel
+from .risk_management import RiskManager
+from .sentiment_analysis import SentimentAnalyzer
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class TradeSignal:
+    """Data class to store trade signals"""
+    symbol: str
+    action: str  # 'buy', 'sell', or 'hold'
+    confidence: float
+    price: float
+    stop_loss: float
+    take_profit: float
+    position_size: float
+    timestamp: datetime
+    technical_score: float
+    ml_score: float
+    sentiment_score: float
+    risk_score: float
+
+class TradingStrategy:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.technical_analyzer = TechnicalAnalyzer(config)
+        self.ml_model = MachineLearningModel(config)
+        self.risk_manager = RiskManager(config)
+        self.sentiment_analyzer = SentimentAnalyzer(config)
+        
+        # Initialize state
+        self.active_trades = {}
+        self.trade_history = []
+        self.performance_metrics = {}
+        
+    def analyze_market(self, symbol: str, data: pd.DataFrame) -> TradeSignal:
+        """
+        Analyze market conditions and generate trading signals
+        """
+        try:
+            # Technical analysis
+            technical_signals = self.technical_analyzer.generate_signals(data)
+            technical_score = technical_signals['signal']
+            
+            # Machine learning prediction
+            ml_predictions = self.ml_model.predict(data)
+            ml_score = ml_predictions[-1] if ml_predictions is not None else 0
+            
+            # Sentiment analysis
+            sentiment_score = self.sentiment_analyzer.get_combined_sentiment(symbol)
+            if sentiment_score is None:
+                sentiment_score = 0
+            
+            # Risk assessment
+            risk_score = self.risk_manager.calculate_risk_metrics()
+            
+            # Combine signals
+            combined_score = (
+                technical_score * self.config['signal_weights']['technical'] +
+                ml_score * self.config['signal_weights']['ml'] +
+                sentiment_score * self.config['signal_weights']['sentiment'] +
+                risk_score * self.config['signal_weights']['risk']
+            )
+            
+            # Generate trading signal
+            current_price = data['close'].iloc[-1]
+            
+            # Calculate stop loss and take profit levels
+            stop_loss = self._calculate_stop_loss(current_price, combined_score)
+            take_profit = self._calculate_take_profit(current_price, combined_score)
+            
+            # Calculate position size
+            position_size, required_margin = self.risk_manager.calculate_position_size(
+                current_price,
+                stop_loss,
+                self.risk_manager.current_capital
+            )
+            
+            # Determine action
+            if combined_score > self.config['signal_thresholds']['buy']:
+                action = 'buy'
+            elif combined_score < self.config['signal_thresholds']['sell']:
+                action = 'sell'
+            else:
+                action = 'hold'
+            
+            # Create trade signal
+            signal = TradeSignal(
+                symbol=symbol,
+                action=action,
+                confidence=abs(combined_score),
+                price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                position_size=position_size,
+                timestamp=datetime.now(),
+                technical_score=technical_score,
+                ml_score=ml_score,
+                sentiment_score=sentiment_score,
+                risk_score=risk_score
+            )
+            
+            return signal
+            
+        except Exception as e:
+            logger.error(f"Error analyzing market: {str(e)}")
+            return None
+    
+    def execute_trade(self, signal: TradeSignal) -> bool:
+        """
+        Execute a trade based on the signal
+        """
+        try:
+            # Validate trade
+            if not self.risk_manager.validate_trade(
+                signal.symbol,
+                signal.position_size,
+                signal.price,
+                signal.stop_loss,
+                signal.take_profit
+            ):
+                return False
+            
+            # Execute trade
+            if signal.action in ['buy', 'sell']:
+                # Update position
+                pnl = self.risk_manager.update_position(
+                    signal.symbol,
+                    signal.price,
+                    signal.price,
+                    signal.position_size,
+                    signal.action
+                )
+                
+                if pnl is not None:
+                    # Record trade
+                    self.trade_history.append({
+                        'symbol': signal.symbol,
+                        'action': signal.action,
+                        'entry_price': signal.price,
+                        'exit_price': signal.price,
+                        'position_size': signal.position_size,
+                        'pnl': pnl,
+                        'entry_time': signal.timestamp,
+                        'exit_time': datetime.now()
+                    })
+                    
+                    # Update performance metrics
+                    self._update_performance_metrics()
+                    
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error executing trade: {str(e)}")
+            return False
+    
+    def update_positions(self, current_prices: Dict[str, float]):
+        """
+        Update all open positions with current prices
+        """
+        try:
+            for symbol, price in current_prices.items():
+                if symbol in self.risk_manager.positions:
+                    position = self.risk_manager.positions[symbol]
+                    pnl = self.risk_manager.update_position(
+                        symbol,
+                        position['entry_price'],
+                        price,
+                        position['position_size'],
+                        position['position_type']
+                    )
+                    
+                    if pnl is not None:
+                        # Record trade
+                        self.trade_history.append({
+                            'symbol': symbol,
+                            'action': 'close',
+                            'entry_price': position['entry_price'],
+                            'exit_price': price,
+                            'position_size': position['position_size'],
+                            'pnl': pnl,
+                            'entry_time': position['entry_time'],
+                            'exit_time': datetime.now()
+                        })
+                        
+                        # Update performance metrics
+                        self._update_performance_metrics()
+            
+        except Exception as e:
+            logger.error(f"Error updating positions: {str(e)}")
+    
+    def _calculate_stop_loss(self, price: float, signal: float) -> float:
+        """
+        Calculate stop loss level based on signal strength
+        """
+        # Adjust stop loss distance based on signal strength
+        base_stop_loss = self.config['stop_loss_pct']
+        signal_factor = abs(signal)
+        stop_loss_distance = base_stop_loss * (1 + signal_factor)
+        
+        if signal > 0:  # Buy signal
+            return price * (1 - stop_loss_distance)
+        else:  # Sell signal
+            return price * (1 + stop_loss_distance)
+    
+    def _calculate_take_profit(self, price: float, signal: float) -> float:
+        """
+        Calculate take profit level based on signal strength
+        """
+        # Adjust take profit distance based on signal strength
+        base_take_profit = self.config['take_profit_pct']
+        signal_factor = abs(signal)
+        take_profit_distance = base_take_profit * (1 + signal_factor)
+        
+        if signal > 0:  # Buy signal
+            return price * (1 + take_profit_distance)
+        else:  # Sell signal
+            return price * (1 - take_profit_distance)
+    
+    def _update_performance_metrics(self):
+        """
+        Update performance metrics based on trade history
+        """
+        if not self.trade_history:
+            return
+        
+        # Convert trade history to DataFrame
+        df = pd.DataFrame(self.trade_history)
+        
+        # Calculate metrics
+        self.performance_metrics = {
+            'total_trades': len(df),
+            'winning_trades': len(df[df['pnl'] > 0]),
+            'losing_trades': len(df[df['pnl'] < 0]),
+            'win_rate': len(df[df['pnl'] > 0]) / len(df),
+            'total_pnl': df['pnl'].sum(),
+            'avg_pnl': df['pnl'].mean(),
+            'max_drawdown': self.risk_manager.risk_metrics.max_drawdown if self.risk_manager.risk_metrics else 0,
+            'sharpe_ratio': self.risk_manager.risk_metrics.sharpe_ratio if self.risk_manager.risk_metrics else 0,
+            'profit_factor': self.risk_manager.risk_metrics.profit_factor if self.risk_manager.risk_metrics else 0
+        }
+    
+    def should_stop_trading(self) -> bool:
+        """
+        Check if trading should be stopped based on risk metrics
+        """
+        return self.risk_manager.should_stop_trading()
+    
+    def save_state(self, filepath: str):
+        """
+        Save trading strategy state
+        """
+        try:
+            state = {
+                'active_trades': self.active_trades,
+                'trade_history': self.trade_history,
+                'performance_metrics': self.performance_metrics,
+                'risk_metrics': self.risk_manager.risk_metrics.__dict__ if self.risk_manager.risk_metrics else None
+            }
+            
+            with open(filepath, 'w') as f:
+                json.dump(state, f, default=str)
+            
+            logger.info(f"Trading strategy state saved to {filepath}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving state: {str(e)}")
+            return False
+    
+    def load_state(self, filepath: str):
+        """
+        Load trading strategy state
+        """
+        try:
+            with open(filepath, 'r') as f:
+                state = json.load(f)
+            
+            self.active_trades = state['active_trades']
+            self.trade_history = state['trade_history']
+            self.performance_metrics = state['performance_metrics']
+            
+            if state['risk_metrics']:
+                self.risk_manager.risk_metrics = RiskMetrics(**state['risk_metrics'])
+            
+            logger.info(f"Trading strategy state loaded from {filepath}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading state: {str(e)}")
+            return False 
+            import numpy as np
+import pandas as pd
+from typing import Dict, Tuple, Optional
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class RiskMetrics:
+    """Data class to store risk metrics"""
+    daily_drawdown: float
+    max_drawdown: float
+    sharpe_ratio: float
+    sortino_ratio: float
+    win_rate: float
+    profit_factor: float
+    avg_win: float
+    avg_loss: float
+    max_consecutive_losses: int
+    max_consecutive_wins: int
+
+class RiskManager:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.initial_capital = config['initial_capital']
+        self.current_capital = self.initial_capital
+        self.risk_per_trade = config['risk_per_trade']
+        self.max_daily_loss = config['max_daily_loss']
+        self.max_drawdown = config['max_drawdown']
+        self.max_positions = config['max_positions']
+        self.leverage = config['leverage']
+        self.stop_loss_pct = config['stop_loss_pct']
+        self.take_profit_pct = config['take_profit_pct']
+        
+        # Performance tracking
+        self.trades_history = []
+        self.daily_pnl = []
+        self.positions = {}
+        self.risk_metrics = None
+        
+    def calculate_position_size(self, 
+                              price: float,
+                              stop_loss: float,
+                              account_balance: float) -> Tuple[float, float]:
+        """
+        Calculate position size based on risk parameters
+        """
+        # Calculate risk amount in base currency
+        risk_amount = account_balance * self.risk_per_trade
+        
+        # Calculate position size based on stop loss
+        price_distance = abs(price - stop_loss)
+        position_size = risk_amount / price_distance
+        
+        # Apply leverage
+        position_size *= self.leverage
+        
+        # Calculate required margin
+        required_margin = (position_size * price) / self.leverage
+        
+        # Ensure we don't exceed maximum position size
+        max_position = account_balance * self.leverage / price
+        position_size = min(position_size, max_position)
+        
+        return position_size, required_margin
+    
+    def validate_trade(self,
+                      symbol: str,
+                      position_size: float,
+                      price: float,
+                      stop_loss: float,
+                      take_profit: float) -> bool:
+        """
+        Validate if a trade meets risk management criteria
+        """
+        # Check if we have too many open positions
+        if len(self.positions) >= self.max_positions:
+            logger.warning("Maximum number of positions reached")
+            return False
+        
+        # Check if symbol is already in a position
+        if symbol in self.positions:
+            logger.warning(f"Position already exists for {symbol}")
+            return False
+        
+        # Calculate potential loss
+        potential_loss = position_size * abs(price - stop_loss)
+        
+        # Check if potential loss exceeds daily limit
+        if potential_loss > self.max_daily_loss:
+            logger.warning("Trade exceeds maximum daily loss limit")
+            return False
+        
+        # Check if stop loss is too far
+        stop_loss_distance = abs(price - stop_loss) / price
+        if stop_loss_distance > self.stop_loss_pct:
+            logger.warning("Stop loss distance exceeds maximum allowed")
+            return False
+        
+        # Check if take profit is reasonable
+        take_profit_distance = abs(take_profit - price) / price
+        if take_profit_distance > self.take_profit_pct:
+            logger.warning("Take profit distance exceeds maximum allowed")
+            return False
+        
+        return True
+    
+    def update_position(self,
+                       symbol: str,
+                       entry_price: float,
+                       current_price: float,
+                       position_size: float,
+                       position_type: str) -> Optional[float]:
+        """
+        Update position and check for stop loss or take profit
+        """
+        if symbol not in self.positions:
+            self.positions[symbol] = {
+                'entry_price': entry_price,
+                'current_price': current_price,
+                'position_size': position_size,
+                'position_type': position_type,
+                'entry_time': datetime.now()
+            }
+            return None
+        
+        position = self.positions[symbol]
+        pnl = 0
+        
+        # Calculate unrealized PnL
+        if position_type == 'long':
+            pnl = (current_price - entry_price) * position_size
+        else:
+            pnl = (entry_price - current_price) * position_size
+        
+        # Check stop loss
+        if position_type == 'long':
+            if current_price <= entry_price * (1 - self.stop_loss_pct):
+                pnl = -position_size * entry_price * self.stop_loss_pct
+                del self.positions[symbol]
+                return pnl
+        else:
+            if current_price >= entry_price * (1 + self.stop_loss_pct):
+                pnl = -position_size * entry_price * self.stop_loss_pct
+                del self.positions[symbol]
+                return pnl
+        
+        # Check take profit
+        if position_type == 'long':
+            if current_price >= entry_price * (1 + self.take_profit_pct):
+                pnl = position_size * entry_price * self.take_profit_pct
+                del self.positions[symbol]
+                return pnl
+        else:
+            if current_price <= entry_price * (1 - self.take_profit_pct):
+                pnl = position_size * entry_price * self.take_profit_pct
+                del self.positions[symbol]
+                return pnl
+        
+        # Update current price
+        position['current_price'] = current_price
+        return None
+    
+    def calculate_risk_metrics(self) -> RiskMetrics:
+        """
+        Calculate various risk metrics
+        """
+        if not self.trades_history:
+            return None
+        
+        # Convert trades history to DataFrame
+        df = pd.DataFrame(self.trades_history)
+        
+        # Calculate daily returns
+        daily_returns = df.groupby(df['exit_time'].dt.date)['pnl'].sum()
+        
+        # Calculate drawdown
+        cumulative_returns = (1 + daily_returns).cumprod()
+        rolling_max = cumulative_returns.expanding().max()
+        drawdowns = (cumulative_returns - rolling_max) / rolling_max
+        
+        # Calculate metrics
+        daily_drawdown = drawdowns.min()
+        max_drawdown = drawdowns.min()
+        
+        # Calculate Sharpe ratio
+        risk_free_rate = 0.02  # 2% annual risk-free rate
+        excess_returns = daily_returns - risk_free_rate/252
+        sharpe_ratio = np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+        
+        # Calculate Sortino ratio
+        downside_returns = excess_returns[excess_returns < 0]
+        sortino_ratio = np.sqrt(252) * excess_returns.mean() / downside_returns.std()
+        
+        # Calculate win rate and profit factor
+        winning_trades = df[df['pnl'] > 0]
+        losing_trades = df[df['pnl'] < 0]
+        win_rate = len(winning_trades) / len(df)
+        profit_factor = abs(winning_trades['pnl'].sum() / losing_trades['pnl'].sum())
+        
+        # Calculate average win and loss
+        avg_win = winning_trades['pnl'].mean()
+        avg_loss = losing_trades['pnl'].mean()
+        
+        # Calculate consecutive wins and losses
+        df['consecutive'] = (df['pnl'] > 0).astype(int)
+        max_consecutive_wins = df['consecutive'].groupby((df['consecutive'] != df['consecutive'].shift()).cumsum()).sum().max()
+        max_consecutive_losses = df['consecutive'].groupby((df['consecutive'] != df['consecutive'].shift()).cumsum()).sum().min()
+        
+        self.risk_metrics = RiskMetrics(
+            daily_drawdown=daily_drawdown,
+            max_drawdown=max_drawdown,
+            sharpe_ratio=sharpe_ratio,
+            sortino_ratio=sortino_ratio,
+            win_rate=win_rate,
+            profit_factor=profit_factor,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            max_consecutive_losses=max_consecutive_losses,
+            max_consecutive_wins=max_consecutive_wins
+        )
+        
+        return self.risk_metrics
+    
+    def should_stop_trading(self) -> bool:
+        """
+        Check if trading should be stopped based on risk metrics
+        """
+        if not self.risk_metrics:
+            return False
+        
+        # Stop if maximum drawdown is exceeded
+        if self.risk_metrics.max_drawdown < -self.max_drawdown:
+            logger.warning("Maximum drawdown exceeded. Stopping trading.")
+            return True
+        
+        # Stop if win rate is too low
+        if self.risk_metrics.win_rate < self.config['min_win_rate']:
+            logger.warning("Win rate below minimum threshold. Stopping trading.")
+            return True
+        
+        # Stop if profit factor is too low
+        if self.risk_metrics.profit_factor < self.config['min_profit_factor']:
+            logger.warning("Profit factor below minimum threshold. Stopping trading.")
+            return True
+        
+        return False 
+        import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+import gym
+import logging
+from typing import Dict, List, Tuple, Optional
+import joblib
+import os
+
+logger = logging.getLogger(__name__)
+
+class MachineLearningModel:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.model_type = config['model_type']
+        self.features = config['features']
+        self.scaler = StandardScaler()
+        self.model = None
+        self.env = None
+        
+    def prepare_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepare data for machine learning
+        """
+        # Select features
+        X = df[self.features].copy()
+        
+        # Create target variable (price movement direction)
+        y = np.where(df['close'].shift(-1) > df['close'], 1, 0)
+        
+        # Drop NaN values
+        valid_idx = ~np.isnan(y)
+        X = X[valid_idx]
+        y = y[valid_idx]
+        
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        return X_scaled, y
+    
+    def train_lstm(self, X: np.ndarray, y: np.ndarray):
+        """
+        Train LSTM model
+        """
+        # Reshape data for LSTM [samples, time steps, features]
+        X_reshaped = np.reshape(X, (X.shape[0], 1, X.shape[1]))
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_reshaped, y,
+            test_size=self.config['train_test_split'],
+            random_state=42
+        )
+        
+        # Create model
+        model = Sequential([
+            LSTM(50, activation='relu', input_shape=(1, X.shape[1]), return_sequences=True),
+            Dropout(0.2),
+            LSTM(50, activation='relu'),
+            Dropout(0.2),
+            Dense(1, activation='sigmoid')
+        ])
+        
+        # Compile model
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        # Train model
+        model.fit(
+            X_train, y_train,
+            epochs=50,
+            batch_size=32,
+            validation_split=self.config['validation_split'],
+            verbose=0
+        )
+        
+        # Evaluate model
+        _, accuracy = model.evaluate(X_test, y_test, verbose=0)
+        logger.info(f"LSTM model accuracy: {accuracy:.4f}")
+        
+        self.model = model
+        return model
+    
+    def train_reinforcement_learning(self, df: pd.DataFrame):
+        """
+        Train reinforcement learning model
+        """
+        # Create custom trading environment
+        self.env = TradingEnvironment(df)
+        self.env = DummyVecEnv([lambda: self.env])
+        
+        # Create and train PPO model
+        model = PPO(
+            "MlpPolicy",
+            self.env,
+            learning_rate=self.config['rl']['learning_rate'],
+            n_steps=self.config['rl']['n_steps'],
+            batch_size=self.config['rl']['batch_size'],
+            n_epochs=self.config['rl']['n_epochs'],
+            gamma=self.config['rl']['gamma'],
+            gae_lambda=self.config['rl']['gae_lambda'],
+            clip_range=self.config['rl']['clip_range'],
+            ent_coef=self.config['rl']['ent_coef'],
+            vf_coef=self.config['rl']['vf_coef'],
+            verbose=1
+        )
+        
+        # Train model
+        model.learn(total_timesteps=10000)
+        
+        self.model = model
+        return model
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Make predictions using the trained model
+        """
+        if self.model is None:
+            logger.error("Model not trained. Call train() first.")
+            return None
+        
+        if self.model_type == 'lstm':
+            X_reshaped = np.reshape(X, (X.shape[0], 1, X.shape[1]))
+            predictions = self.model.predict(X_reshaped)
+        else:  # reinforcement learning
+            predictions = self.model.predict(X)
+        
+        return predictions
+    
+    def save_model(self, filepath: str):
+        """
+        Save the trained model
+        """
+        if self.model is None:
+            logger.error("Model not trained. Call train() first.")
+            return None
+        
+        try:
+            if self.model_type == 'lstm':
+                self.model.save(filepath)
+            else:
+                self.model.save(f"{filepath}_rl")
+            
+            # Save scaler separately
+            joblib.dump(self.scaler, f"{filepath}_scaler")
+            
+            logger.info(f"Model saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving model: {str(e)}")
+            return False
+    
+    def load_model(self, filepath: str):
+        """
+        Load a trained model
+        """
+        try:
+            if self.model_type == 'lstm':
+                self.model = tf.keras.models.load_model(filepath)
+            else:
+                self.model = PPO.load(f"{filepath}_rl")
+            
+            # Load scaler
+            self.scaler = joblib.load(f"{filepath}_scaler")
+            
+            logger.info(f"Model loaded from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            return False
+
+
+class TradingEnvironment(gym.Env):
+    """
+    Custom trading environment for reinforcement learning
+    """
+    def __init__(self, df: pd.DataFrame):
+        super(TradingEnvironment, self).__init__()
+        
+        self.df = df
+        self.current_step = 0
+        self.initial_balance = 10000
+        self.balance = self.initial_balance
+        self.position = 0
+        self.position_size = 0
+        
+        # Define action and observation space
+        self.action_space = gym.spaces.Discrete(3)  # Buy, Sell, Hold
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(len(df.columns),),
+            dtype=np.float32
+        )
+    
+    def reset(self):
+        """
+        Reset the environment
+        """
+        self.current_step = 0
+        self.balance = self.initial_balance
+        self.position = 0
+        self.position_size = 0
+        
+        return self._get_observation()
+    
+    def step(self, action):
+        """
+        Execute one step in the environment
+        """
+        # Get current price
+        current_price = self.df['close'].iloc[self.current_step]
+        
+        # Execute action
+        reward = 0
+        done = False
+        
+        if action == 0:  # Buy
+            if self.position <= 0:
+                self.position = 1
+                self.position_size = self.balance / current_price
+        elif action == 1:  # Sell
+            if self.position >= 0:
+                self.position = -1
+                self.position_size = self.balance / current_price
+        
+        # Calculate reward
+        next_price = self.df['close'].iloc[self.current_step + 1]
+        price_change = (next_price - current_price) / current_price
+        
+        if self.position != 0:
+            reward = self.position * price_change * 100
+        
+        # Update balance
+        self.balance *= (1 + reward/100)
+        
+        # Move to next step
+        self.current_step += 1
+        
+        # Check if episode is done
+        if self.current_step >= len(self.df) - 1:
+            done = True
+        
+        return self._get_observation(), reward, done, {}
+    
+    def _get_observation(self):
+        """
+        Get current observation
+        """
+        return self.df.iloc[self.current_step].values.astype(np.float32)
+    
+    def render(self):
+        """
+        Render the environment
+        """
+        pass
+    
+    def close(self):
+        """
+        Clean up resources
+        """
+        pass 
+        import numpy as np
+import pandas as pd
+import talib
+from typing import Dict, List, Tuple, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TechnicalAnalyzer:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.indicators = {}
+        self.patterns = {}
+    
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add technical indicators to the dataframe
+        """
+        df = df.copy()
+        
+        # Trend Indicators
+        df['sma_20'] = talib.SMA(df['close'], timeperiod=20)
+        df['sma_50'] = talib.SMA(df['close'], timeperiod=50)
+        df['sma_200'] = talib.SMA(df['close'], timeperiod=200)
+        df['ema_20'] = talib.EMA(df['close'], timeperiod=20)
+        
+        # Volatility Indicators
+        df['upperband'], df['middleband'], df['lowerband'] = talib.BBANDS(
+            df['close'],
+            timeperiod=self.config['indicators']['bollinger_bands']['period'],
+            nbdevup=self.config['indicators']['bollinger_bands']['std_dev'],
+            nbdevdn=self.config['indicators']['bollinger_bands']['std_dev']
+        )
+        df['atr'] = talib.ATR(
+            df['high'],
+            df['low'],
+            df['close'],
+            timeperiod=self.config['indicators']['atr']['period']
+        )
+        
+        # Momentum Indicators
+        df['rsi'] = talib.RSI(
+            df['close'],
+            timeperiod=self.config['indicators']['rsi']['period']
+        )
+        df['macd'], df['macdsignal'], df['macdhist'] = talib.MACD(
+            df['close'],
+            fastperiod=self.config['indicators']['macd']['fast_period'],
+            slowperiod=self.config['indicators']['macd']['slow_period'],
+            signalperiod=self.config['indicators']['macd']['signal_period']
+        )
+        
+        # Volume Indicators
+        df['obv'] = talib.OBV(df['close'], df['volume'])
+        
+        # Additional Indicators
+        df['adx'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
+        df['cci'] = talib.CCI(df['high'], df['low'], df['close'], timeperiod=14)
+        df['stoch_k'], df['stoch_d'] = talib.STOCH(
+            df['high'],
+            df['low'],
+            df['close'],
+            fastk_period=14,
+            slowk_period=3,
+            slowd_period=3
+        )
+        
+        # Store indicators for reference
+        self.indicators = {
+            'trend': ['sma_20', 'sma_50', 'sma_200', 'ema_20'],
+            'volatility': ['upperband', 'middleband', 'lowerband', 'atr'],
+            'momentum': ['rsi', 'macd', 'macdsignal', 'macdhist'],
+            'volume': ['obv'],
+            'additional': ['adx', 'cci', 'stoch_k', 'stoch_d']
+        }
+        
+        return df
+    
+    def detect_patterns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Detect candlestick patterns and chart patterns
+        """
+        df = df.copy()
+        
+        # Candlestick Patterns
+        if self.config['patterns']['candlestick']:
+            df['doji'] = talib.CDLDOJI(df['open'], df['high'], df['low'], df['close'])
+            df['hammer'] = talib.CDLHAMMER(df['open'], df['high'], df['low'], df['close'])
+            df['engulfing'] = talib.CDLENGULFING(df['open'], df['high'], df['low'], df['close'])
+            df['morning_star'] = talib.CDLMORNINGSTAR(df['open'], df['high'], df['low'], df['close'])
+            df['evening_star'] = talib.CDLEVENINGSTAR(df['open'], df['high'], df['low'], df['close'])
+        
+        # Chart Patterns
+        if self.config['patterns']['chart']:
+            df['head_and_shoulders'] = self._detect_head_and_shoulders(df)
+            df['double_top'] = self._detect_double_top(df)
+            df['double_bottom'] = self._detect_double_bottom(df)
+            df['triangle'] = self._detect_triangle(df)
+        
+        return df
+    
+    def _detect_head_and_shoulders(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Detect head and shoulders pattern
+        """
+        pattern = pd.Series(0, index=df.index)
+        
+        for i in range(20, len(df) - 20):
+            # Find potential left shoulder
+            left_shoulder = df['high'].iloc[i-20:i].max()
+            left_shoulder_idx = df['high'].iloc[i-20:i].idxmax()
+            
+            # Find potential head
+            head = df['high'].iloc[i-10:i+10].max()
+            head_idx = df['high'].iloc[i-10:i+10].idxmax()
+            
+            # Find potential right shoulder
+            right_shoulder = df['high'].iloc[i:i+20].max()
+            right_shoulder_idx = df['high'].iloc[i:i+20].idxmax()
+            
+            # Find neckline
+            neckline = min(df['low'].iloc[left_shoulder_idx:right_shoulder_idx])
+            
+            # Check pattern conditions
+            if (left_shoulder < head and right_shoulder < head and
+                abs(left_shoulder - right_shoulder) / head < 0.1):
+                pattern.iloc[i] = 1
+        
+        return pattern
+    
+    def _detect_double_top(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Detect double top pattern
+        """
+        pattern = pd.Series(0, index=df.index)
+        
+        for i in range(20, len(df) - 20):
+            # Find potential first peak
+            first_peak = df['high'].iloc[i-20:i].max()
+            first_peak_idx = df['high'].iloc[i-20:i].idxmax()
+            
+            # Find potential second peak
+            second_peak = df['high'].iloc[i:i+20].max()
+            second_peak_idx = df['high'].iloc[i:i+20].idxmax()
+            
+            # Find valley between peaks
+            valley = df['low'].iloc[first_peak_idx:second_peak_idx].min()
+            
+            # Check pattern conditions
+            if (abs(first_peak - second_peak) / first_peak < 0.02 and
+                (first_peak - valley) / first_peak > 0.02):
+                pattern.iloc[i] = 1
+        
+        return pattern
+    
+    def _detect_double_bottom(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Detect double bottom pattern
+        """
+        pattern = pd.Series(0, index=df.index)
+        
+        for i in range(20, len(df) - 20):
+            # Find potential first bottom
+            first_bottom = df['low'].iloc[i-20:i].min()
+            first_bottom_idx = df['low'].iloc[i-20:i].idxmin()
+            
+            # Find potential second bottom
+            second_bottom = df['low'].iloc[i:i+20].min()
+            second_bottom_idx = df['low'].iloc[i:i+20].idxmin()
+            
+            # Find peak between bottoms
+            peak = df['high'].iloc[first_bottom_idx:second_bottom_idx].max()
+            
+            # Check pattern conditions
+            if (abs(first_bottom - second_bottom) / first_bottom < 0.02 and
+                (peak - first_bottom) / first_bottom > 0.02):
+                pattern.iloc[i] = 1
+        
+        return pattern
+    
+    def _detect_triangle(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Detect triangle patterns (ascending, descending, symmetrical)
+        """
+        pattern = pd.Series(0, index=df.index)
+        
+        for i in range(20, len(df) - 20):
+            # Get highs and lows for the period
+            highs = df['high'].iloc[i-20:i]
+            lows = df['low'].iloc[i-20:i]
+            
+            # Calculate trend lines
+            high_slope = np.polyfit(range(len(highs)), highs, 1)[0]
+            low_slope = np.polyfit(range(len(lows)), lows, 1)[0]
+            
+            # Classify triangle type
+            if abs(high_slope) < 0.001 and low_slope > 0.001:
+                pattern.iloc[i] = 1  # Ascending triangle
+            elif high_slope < -0.001 and abs(low_slope) < 0.001:
+                pattern.iloc[i] = 2  # Descending triangle
+            elif abs(high_slope + low_slope) < 0.001:
+                pattern.iloc[i] = 3  # Symmetrical triangle
+        
+        return pattern
+    
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate trading signals based on technical indicators and patterns
+        """
+        df = df.copy()
+        
+        # Initialize signal column
+        df['signal'] = 0
+        
+        # RSI signals
+        df.loc[df['rsi'] < self.config['indicators']['rsi']['oversold'], 'signal'] += 1
+        df.loc[df['rsi'] > self.config['indicators']['rsi']['overbought'], 'signal'] -= 1
+        
+        # MACD signals
+        df.loc[df['macd'] > df['macdsignal'], 'signal'] += 1
+        df.loc[df['macd'] < df['macdsignal'], 'signal'] -= 1
+        
+        # Bollinger Bands signals
+        df.loc[df['close'] < df['lowerband'], 'signal'] += 1
+        df.loc[df['close'] > df['upperband'], 'signal'] -= 1
+        
+        # Trend signals
+        df.loc[df['close'] > df['sma_20'], 'signal'] += 1
+        df.loc[df['close'] < df['sma_20'], 'signal'] -= 1
+        
+        # Pattern signals
+        if 'head_and_shoulders' in df.columns:
+            df.loc[df['head_and_shoulders'] == 1, 'signal'] -= 1
+        if 'double_top' in df.columns:
+            df.loc[df['double_top'] == 1, 'signal'] -= 1
+        if 'double_bottom' in df.columns:
+            df.loc[df['double_bottom'] == 1, 'signal'] += 1
+        if 'triangle' in df.columns:
+            df.loc[df['triangle'] == 1, 'signal'] += 1  # Ascending
+            df.loc[df['triangle'] == 2, 'signal'] -= 1  # Descending
+        
+        # Normalize signals to -1, 0, 1
+        df['signal'] = df['signal'].apply(lambda x: 1 if x > 2 else (-1 if x < -2 else 0))
+        
+        return df
+    
+    def calculate_support_resistance(self, df: pd.DataFrame, window: int = 20) -> Tuple[pd.Series, pd.Series]:
+        """
+        Calculate support and resistance levels
+        """
+        support = df['low'].rolling(window=window).min()
+        resistance = df['high'].rolling(window=window).max()
+        
+        return support, resistance
+    
+    def calculate_volatility(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Calculate various volatility measures
+        """
+        # ATR-based volatility
+        atr_volatility = df['atr'] / df['close']
+        
+        # Bollinger Band width
+        bb_width = (df['upperband'] - df['lowerband']) / df['middleband']
+        
+        # Historical volatility
+        returns = df['close'].pct_change()
+        hist_volatility = returns.rolling(window=20).std()
+        
+        return pd.DataFrame({
+            'atr_volatility': atr_volatility,
+            'bb_width': bb_width,
+            'hist_volatility': hist_volatility
+        })
+    
+    def get_market_regime(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Determine market regime (trending, ranging, volatile)
+        """
+        regime = pd.Series('unknown', index=df.index)
+        
+        # Calculate ADX for trend strength
+        adx = df['adx']
+        
+        # Calculate volatility
+        volatility = self.calculate_volatility(df)['atr_volatility']
+        
+        # Determine regime
+        regime.loc[adx > 25] = 'trending'
+        regime.loc[(adx <= 25) & (volatility > volatility.rolling(window=20).mean())] = 'volatile'
+        regime.loc[(adx <= 25) & (volatility <= volatility.rolling(window=20).mean())] = 'ranging'
+        
+        return regime 
+        import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import logging
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import json
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/trading_system.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Trade:
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    position_size: float
+    entry_time: datetime
+    exit_price: Optional[float] = None
+    exit_time: Optional[datetime] = None
+    pnl: Optional[float] = None
+    status: str = 'open'
+
+class TradingSystem:
+    def __init__(self, initial_capital: float = 50.0):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.performance_history: List[Dict] = []
+        self.active_trades: Dict[str, Trade] = {}
+        self.trade_history: List[Trade] = []
+        self.strategy_parameters = self._get_initial_parameters()
+        self.risk_metrics = self._initialize_risk_metrics()
+        self.last_recalibration = datetime.now()
+        
+        # Load configuration
+        self._load_config()
+        
+    def _load_config(self):
+        """Load configuration from config file"""
+        try:
+            with open('config/config.json', 'r') as f:
+                self.config = json.load(f)
+        except FileNotFoundError:
+            logger.warning("Config file not found. Using default parameters.")
+            self.config = self._get_default_config()
+    
+    def _get_default_config(self) -> Dict:
+        """Get default configuration parameters"""
+        return {
+            'risk_per_trade': 0.01,  # 1% risk per trade
+            'max_positions': 2,
+            'min_win_rate': 0.4,
+            'recalibration_window': 20,
+            'max_drawdown': 0.1,  # 10% maximum drawdown
+            'leverage': 1,  # No leverage initially
+            'position_sizing': {
+                'method': 'fixed_fractional',
+                'fraction': 0.01  # 1% of capital per trade
+            }
+        }
+    
+    def _get_initial_parameters(self) -> Dict:
+        """Get initial strategy parameters"""
+        return {
+            'rsi_period': 14,
+            'rsi_overbought': 70,
+            'rsi_oversold': 30,
+            'bb_period': 20,
+            'bb_std': 2,
+            'macd_fast': 12,
+            'macd_slow': 26,
+            'macd_signal': 9,
+            'atr_period': 14,
+            'atr_multiplier': 2
+        }
+    
+    def _initialize_risk_metrics(self) -> Dict:
+        """Initialize risk metrics tracking"""
+        return {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'max_drawdown': 0.0,
+            'current_drawdown': 0.0,
+            'avg_trade': 0.0,
+            'largest_win': 0.0,
+            'largest_loss': 0.0
+        }
+    
+    def monitor_performance(self, window_size: int = 20) -> bool:
+        """
+        Monitor recent performance and determine if recalibration is needed
+        Returns True if recalibration is needed
+        """
+        if len(self.performance_history) < window_size:
+            return False
+            
+        recent_performance = self.performance_history[-window_size:]
+        win_rate = sum(1 for trade in recent_performance if trade['pnl'] > 0) / window_size
+        
+        # Check various performance metrics
+        needs_recalibration = False
+        
+        # Win rate check
+        if win_rate < self.config['min_win_rate']:
+            logger.warning(f"Win rate {win_rate:.2%} below threshold {self.config['min_win_rate']:.2%}")
+            needs_recalibration = True
+        
+        # Drawdown check
+        current_drawdown = self._calculate_drawdown()
+        if current_drawdown > self.config['max_drawdown']:
+            logger.warning(f"Current drawdown {current_drawdown:.2%} exceeds maximum {self.config['max_drawdown']:.2%}")
+            needs_recalibration = True
+        
+        # Profit factor check
+        profit_factor = self._calculate_profit_factor(recent_performance)
+        if profit_factor < 1.0:
+            logger.warning(f"Profit factor {profit_factor:.2f} below 1.0")
+            needs_recalibration = True
+        
+        return needs_recalibration
+    
+    def recalibrate_strategy(self, market_data: pd.DataFrame):
+        """
+        Adjust strategy parameters based on recent market conditions
+        """
+        logger.info("Starting strategy recalibration")
+        
+        # Analyze market conditions
+        volatility = self._calculate_volatility(market_data)
+        trend_strength = self._calculate_trend_strength(market_data)
+        
+        # Adjust parameters based on market conditions
+        new_parameters = self.strategy_parameters.copy()
+        
+        # Adjust RSI levels based on volatility
+        if volatility > 0.02:  # High volatility
+            new_parameters['rsi_overbought'] = 75
+            new_parameters['rsi_oversold'] = 25
+        else:  # Low volatility
+            new_parameters['rsi_overbought'] = 70
+            new_parameters['rsi_oversold'] = 30
+        
+        # Adjust ATR multiplier based on trend strength
+        if trend_strength > 0.7:  # Strong trend
+            new_parameters['atr_multiplier'] = 2.5
+        else:  # Weak trend
+            new_parameters['atr_multiplier'] = 2.0
+        
+        # Update parameters
+        self.strategy_parameters = new_parameters
+        self.last_recalibration = datetime.now()
+        
+        logger.info("Strategy recalibration completed")
+        logger.info(f"New parameters: {new_parameters}")
+    
+    def calculate_position_size(self, entry_price: float, stop_loss: float) -> float:
+        """
+        Calculate position size based on risk management rules
+        """
+        risk_amount = self.current_capital * self.config['risk_per_trade']
+        risk_per_unit = abs(entry_price - stop_loss)
+        
+        if risk_per_unit == 0:
+            logger.warning("Risk per unit is zero. Cannot calculate position size.")
+            return 0
+        
+        position_size = risk_amount / risk_per_unit
+        
+        # Apply leverage if configured
+        if self.config['leverage'] > 1:
+            position_size *= self.config['leverage']
+        
+        # Ensure position size doesn't exceed maximum allowed
+        max_position = self.current_capital * self.config['position_sizing']['fraction']
+        position_size = min(position_size, max_position)
+        
+        return position_size
+    
+    def _calculate_volatility(self, data: pd.DataFrame) -> float:
+        """Calculate market volatility"""
+        returns = data['close'].pct_change()
+        return returns.std()
+    
+    def _calculate_trend_strength(self, data: pd.DataFrame) -> float:
+        """Calculate trend strength using ADX"""
+        # Implementation would go here
+        return 0.5  # Placeholder
+    
+    def _calculate_drawdown(self) -> float:
+        """Calculate current drawdown"""
+        if not self.performance_history:
+            return 0.0
+        
+        peak = max(self.performance_history, key=lambda x: x['equity'])['equity']
+        current = self.performance_history[-1]['equity']
+        return (peak - current) / peak
+    
+    def _calculate_profit_factor(self, trades: List[Dict]) -> float:
+        """Calculate profit factor from recent trades"""
+        gross_profit = sum(t['pnl'] for t in trades if t['pnl'] > 0)
+        gross_loss = abs(sum(t['pnl'] for t in trades if t['pnl'] < 0))
+        
+        if gross_loss == 0:
+            return float('inf')
+        
+        return gross_profit / gross_loss
+    
+    def update_risk_metrics(self, trade: Trade):
+        """Update risk metrics after a trade"""
+        self.risk_metrics['total_trades'] += 1
+        
+        if trade.pnl and trade.pnl > 0:
+            self.risk_metrics['winning_trades'] += 1
+            self.risk_metrics['largest_win'] = max(
+                self.risk_metrics['largest_win'],
+                trade.pnl
+            )
+        elif trade.pnl and trade.pnl < 0:
+            self.risk_metrics['losing_trades'] += 1
+            self.risk_metrics['largest_loss'] = min(
+                self.risk_metrics['largest_loss'],
+                trade.pnl
+            )
+        
+        # Update win rate
+        if self.risk_metrics['total_trades'] > 0:
+            self.risk_metrics['win_rate'] = (
+                self.risk_metrics['winning_trades'] / 
+                self.risk_metrics['total_trades']
+            )
+        
+        # Update average trade
+        if trade.pnl:
+            self.risk_metrics['avg_trade'] = (
+                (self.risk_metrics['avg_trade'] * (self.risk_metrics['total_trades'] - 1) + 
+                 trade.pnl) / self.risk_metrics['total_trades']
+            )
+    
+    def save_state(self):
+        """Save current system state"""
+        state = {
+            'current_capital': self.current_capital,
+            'strategy_parameters': self.strategy_parameters,
+            'risk_metrics': self.risk_metrics,
+            'last_recalibration': self.last_recalibration.isoformat(),
+            'active_trades': {
+                symbol: {
+                    'direction': trade.direction,
+                    'entry_price': trade.entry_price,
+                    'stop_loss': trade.stop_loss,
+                    'take_profit': trade.take_profit,
+                    'position_size': trade.position_size,
+                    'entry_time': trade.entry_time.isoformat()
+                }
+                for symbol, trade in self.active_trades.items()
+            }
+        }
+        
+        try:
+            with open('data/system_state.json', 'w') as f:
+                json.dump(state, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error saving system state: {str(e)}")
+    
+    def load_state(self):
+        """Load system state from file"""
+        try:
+            with open('data/system_state.json', 'r') as f:
+                state = json.load(f)
+                
+            self.current_capital = state['current_capital']
+            self.strategy_parameters = state['strategy_parameters']
+            self.risk_metrics = state['risk_metrics']
+            self.last_recalibration = datetime.fromisoformat(state['last_recalibration'])
+            
+            # Reconstruct active trades
+            self.active_trades = {}
+            for symbol, trade_data in state['active_trades'].items():
+                self.active_trades[symbol] = Trade(
+                    symbol=symbol,
+                    direction=trade_data['direction'],
+                    entry_price=trade_data['entry_price'],
+                    stop_loss=trade_data['stop_loss'],
+                    take_profit=trade_data['take_profit'],
+                    position_size=trade_data['position_size'],
+                    entry_time=datetime.fromisoformat(trade_data['entry_time'])
+                )
+        except FileNotFoundError:
+            logger.info("No saved state found. Starting fresh.")
+        except Exception as e:
+            logger.error(f"Error loading system state: {str(e)}")
+    
+    def get_system_status(self) -> Dict:
+        """Get current system status"""
+        return {
+            'current_capital': self.current_capital,
+            'total_trades': self.risk_metrics['total_trades'],
+            'win_rate': self.risk_metrics['win_rate'],
+            'profit_factor': self.risk_metrics['profit_factor'],
+            'current_drawdown': self.risk_metrics['current_drawdown'],
+            'active_trades': len(self.active_trades),
+            'last_recalibration': self.last_recalibration.isoformat(),
+            'strategy_parameters': self.strategy_parameters
+        } 
+        import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Exchange Configuration
+EXCHANGE_CONFIG = {
+    'name': 'binance',
+    'api_key': os.getenv('BINANCE_API_KEY', ''),
+    'api_secret': os.getenv('BINANCE_API_SECRET', ''),
+    'testnet': True  # Use testnet for development
+}
+
+# Trading Parameters
+TRADING_CONFIG = {
+    'symbols': ['BTC/USDT', 'ETH/USDT', 'EUR/USD'],
+    'timeframes': ['1h', '4h', '1d'],
+    'initial_capital': 10000,
+    'risk_per_trade': 0.02,  # 2% risk per trade
+    'max_positions': 3,
+    'position_sizing': {
+        'method': 'fixed_fractional',
+        'fraction': 0.02  # 2% of capital per trade
+    }
+}
+
+# Technical Analysis Parameters
+TECHNICAL_CONFIG = {
+    'indicators': {
+        'bollinger_bands': {
+            'period': 20,
+            'std_dev': 2
+        },
+        'rsi': {
+            'period': 14,
+            'overbought': 70,
+            'oversold': 30
+        },
+        'macd': {
+            'fast_period': 12,
+            'slow_period': 26,
+            'signal_period': 9
+        },
+        'atr': {
+            'period': 14
+        }
+    },
+    'patterns': {
+        'head_and_shoulders': True,
+        'double_top_bottom': True,
+        'triangles': True
+    }
+}
+
+# Machine Learning Configuration
+ML_CONFIG = {
+    'model_type': 'lstm',  # Options: 'lstm', 'rf', 'xgboost'
+    'features': [
+        'open', 'high', 'low', 'close', 'volume',
+        'sma_20', 'sma_50', 'rsi', 'macd', 'atr',
+        'bb_upper', 'bb_lower', 'bb_width'
+    ],
+    'sequence_length': 10,
+    'prediction_horizon': 1,
+    'train_test_split': 0.8,
+    'validation_split': 0.1
+}
+
+# Reinforcement Learning Configuration
+RL_CONFIG = {
+    'algorithm': 'PPO',
+    'learning_rate': 0.0003,
+    'n_steps': 2048,
+    'batch_size': 64,
+    'n_epochs': 10,
+    'gamma': 0.99,
+    'gae_lambda': 0.95,
+    'clip_range': 0.2,
+    'ent_coef': 0.01,
+    'vf_coef': 0.5
+}
+
+# Risk Management Configuration
+RISK_CONFIG = {
+    'stop_loss': {
+        'method': 'atr',
+        'atr_multiplier': 2
+    },
+    'take_profit': {
+        'method': 'risk_reward',
+        'risk_reward_ratio': 2
+    },
+    'trailing_stop': {
+        'enabled': True,
+        'activation_percentage': 0.02,
+        'trail_percentage': 0.01
+    }
+}
+
+# Sentiment Analysis Configuration
+SENTIMENT_CONFIG = {
+    'sources': [
+        'reuters',
+        'bloomberg',
+        'forexfactory'
+    ],
+    'update_interval': 3600,  # 1 hour
+    'weight': 0.2  # Weight in final decision
+}
+
+# Backtesting Configuration
+BACKTEST_CONFIG = {
+    'start_date': '2020-01-01',
+    'end_date': '2023-12-31',
+    'initial_capital': 10000,
+    'commission': 0.001,  # 0.1%
+    'slippage': 0.0001    # 0.01%
+}
+
+# Logging Configuration
+LOGGING_CONFIG = {
+    'level': 'INFO',
+    'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    'file': 'logs/trading_bot.log'
+}
+
+# Web Dashboard Configuration
+DASHBOARD_CONFIG = {
+    'host': '0.0.0.0',
+    'port': 5000,
+    'debug': False,
+    'update_interval': 5  # seconds
+} 
+numpy>=1.21.0
+pandas>=1.3.0
+ccxt>=2.0.0
+scikit-learn>=0.24.2
+tensorflow>=2.6.0
+stable-baselines3>=1.5.0
+gym>=0.21.0
+ta-lib>=0.4.24
+textblob>=0.15.3
+tweepy>=4.10.0
+newsapi-python>=0.2.6
+yfinance>=0.1.63
+schedule>=1.1.0
+joblib>=1.0.2
+python-dotenv>=0.19.0
+flask>=2.0.1
+plotly>=5.3.1
+dash>=2.0.0 
