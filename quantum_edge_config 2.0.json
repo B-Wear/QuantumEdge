@@ -1,0 +1,137 @@
+{
+    "system": {
+        "name": "Quantum Edge System",
+        "version": "1.0.0",
+        "log_level": "INFO",
+        "dashboard_port": 8050
+    },
+    "trading": {
+        "exchange": {
+            "name": "binance",
+            "testnet": true,
+            "api_key": "YOUR_API_KEY",
+            "api_secret": "YOUR_API_SECRET"
+        },
+        "markets": ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD"],
+        "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"],
+        "default_leverage": 1.0,
+        "position_types": ["long", "short"],
+        "order_types": ["market", "limit", "stop_loss", "take_profit"]
+    },
+    "ml_model": {
+        "default_type": "lstm",
+        "lstm": {
+            "layers": [64, 32],
+            "dropout": 0.2,
+            "learning_rate": 0.001,
+            "batch_size": 32,
+            "epochs": 100,
+            "validation_split": 0.2,
+            "sequence_length": 60
+        },
+        "reinforcement": {
+            "model_type": "ppo",
+            "policy_network": [64, 64],
+            "value_network": [64, 32],
+            "learning_rate": 0.0003,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_ratio": 0.2,
+            "train_iterations": 80
+        },
+        "features": {
+            "price": ["open", "high", "low", "close"],
+            "volume": ["volume", "taker_buy_volume"],
+            "technical": [
+                "rsi", "macd", "bollinger_bands",
+                "moving_averages", "momentum", "volatility"
+            ]
+        }
+    },
+    "risk_management": {
+        "position_sizing": {
+            "max_position_size": 0.1,
+            "max_leverage": 3.0,
+            "min_position_size": 0.01
+        },
+        "risk_limits": {
+            "max_drawdown": 0.2,
+            "var_limit": 0.05,
+            "min_sharpe": 1.0,
+            "max_correlation": 0.7
+        },
+        "stop_loss": {
+            "default_percentage": 0.02,
+            "trailing_stop": true,
+            "activation_percentage": 0.01
+        },
+        "take_profit": {
+            "default_percentage": 0.03,
+            "trailing_take_profit": true,
+            "activation_percentage": 0.015
+        },
+        "exposure_limits": {
+            "max_total_exposure": 1.0,
+            "max_single_market": 0.3,
+            "max_correlated_exposure": 0.5
+        }
+    },
+    "sentiment_analysis": {
+        "providers": {
+            "news": {
+                "api_key": "YOUR_NEWS_API_KEY",
+                "sources": ["reuters", "bloomberg", "coindesk"],
+                "update_interval": 300
+            },
+            "social": {
+                "twitter_api_key": "YOUR_TWITTER_API_KEY",
+                "twitter_api_secret": "YOUR_TWITTER_API_SECRET",
+                "reddit_client_id": "YOUR_REDDIT_CLIENT_ID",
+                "reddit_client_secret": "YOUR_REDDIT_CLIENT_SECRET",
+                "update_interval": 60
+            }
+        },
+        "analysis": {
+            "sentiment_window": 3600,
+            "min_confidence": 0.6,
+            "impact_threshold": 0.3,
+            "correlation_threshold": 0.5
+        }
+    },
+    "optimization": {
+        "system": {
+            "cpu_threshold": 80,
+            "memory_threshold": 80,
+            "network_latency_threshold": 1000,
+            "optimization_interval": 3600
+        },
+        "trading": {
+            "min_win_rate": 0.55,
+            "min_profit_factor": 1.5,
+            "max_drawdown": 0.2,
+            "optimization_lookback": 1000
+        },
+        "ml_model": {
+            "min_accuracy": 0.6,
+            "min_sharpe": 1.0,
+            "max_drawdown": 0.15,
+            "retraining_interval": 86400
+        }
+    },
+    "monitoring": {
+        "metrics_update_interval": 60,
+        "health_check_interval": 300,
+        "alert_thresholds": {
+            "cpu_usage": 90,
+            "memory_usage": 90,
+            "api_latency": 2000,
+            "error_rate": 0.01
+        },
+        "performance_thresholds": {
+            "min_daily_profit": -0.02,
+            "max_daily_loss": -0.05,
+            "min_win_rate": 0.5,
+            "min_profit_factor": 1.2
+        }
+    }
+} 
